@@ -61,8 +61,15 @@ benchmarks.
 
 ## Milestone 1 — Deterministic logical cache simulator (`v0.1`)
 
-**Outcome:** a useful offline tool for comparing basic policies on synthetic
-traces under byte budgets.
+**Outcome:** a reproducible methodology infrastructure — canonical event
+format, deterministic replay, and fair policy comparison — on synthetic traces
+under byte budgets.
+
+v0.1 is a methodology and reproducibility contribution, not a decision tool.
+On its own it is not expected to overturn the known result that LRU is a
+reasonable baseline for expert caching. Its value is a canonical format, a
+shared memory-accounting basis, and byte/object metric separation that
+inter-paper comparisons today lack.
 
 ### Slice 1A — Replay and accounting
 
@@ -113,7 +120,11 @@ solver independently verifies tiny variable-size optima.
 - Classic Belady does not lose to online policies on the same uniform-size
   objective.
 - Online variable-size policy costs are compared with the bounded optimum but
-  are not expected to match it.
+  are not expected to match it. The most informative v0.1 results are
+  uniform-size (where classic Belady is a true optimum); variable-size results
+  are descriptive only, because general variable-size caching is NP-hard and
+  no scalable optimum is offered in v0.1. Practical lower bounds for large
+  variable-size traces are deferred to research work after v0.1.
 - No scalable greedy policy is presented as the general offline optimum.
 - Reports clearly separate object and byte metrics.
 - On the pinned CI runner, online policies process `synthetic-100k` with peak
@@ -126,6 +137,27 @@ solver independently verifies tiny variable-size optima.
 
 Stop and assess whether logical comparisons already answer useful questions.
 Do not add storage timing simply to continue the roadmap.
+
+Kill criteria (pre-committed, to defeat continuation bias):
+
+- If no online policy differs from LRU by more than 5% on any byte-cost
+  metric at any tested budget on `synthetic-100k`, the field likely does not
+  need this tool — stop.
+- If LRU/LFU/Belady differences are dominated by seed noise on the reference
+  workload, the caching question is mis-posed for this workload — stop or
+  redesign the workload before continuing.
+- If neither kill condition triggers, the gate is passed and M2 may be
+  planned.
+
+The 5% threshold is chosen before measurement; it may be revised only with a
+documented reason and only before any policy result is observed.
+
+### Minimum citable artifact
+
+Completing M1 produces the minimum citable contribution of the project: a
+canonical activation-event format and a reproducible policy comparison on
+synthetic traces under byte budgets. If M2 and later never ship, M1 alone is
+a legitimate methodology / tooling contribution and a valid stopping point.
 
 ## Milestone 2 — One reproducible real-trace adapter (`v0.2`)
 
@@ -169,6 +201,15 @@ A second dataset adapter, embeddings, learned predictors, and full-dataset
 sweeps.
 
 ## Milestone 3 — Layout-aware storage schedules (`v0.3`)
+
+> **Optional research extension.** Milestones 3–6 are research work, not the
+> canonical path forward. Each gate (M3, M4, M5) may decide to stop and
+> publish the logical simulator (end of M2) as the project's final state.
+> M5 alone — at least 20 randomized runs, multi-OS backends, multi-device,
+> calibration disjoint from held-out replay — is a multi-month research
+> effort and must not be treated as a milestone like the earlier ones. The
+> MoE field shifts architectures and expert layouts every few months, so any
+> plan beyond M2 must be re-estimated at each gate.
 
 **Outcome:** logical misses become inspectable physical read schedules, without
 claiming device latency.
