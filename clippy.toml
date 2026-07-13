@@ -1,0 +1,17 @@
+msrv = "1.97.0"
+doc-valid-idents = [
+  "CLI",
+  "CSV",
+  "JSON",
+  "LFU",
+  "LRU",
+  "Linux",
+  "MoE",
+  "NVMe",
+  "Rust",
+  "SSD",
+  "TOML",
+  "macOS",
+]
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
