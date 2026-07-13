@@ -65,11 +65,16 @@ benchmarks.
 format, deterministic replay, and fair policy comparison — on synthetic traces
 under byte budgets.
 
-v0.1 is a methodology and reproducibility contribution, not a decision tool.
-On its own it is not expected to overturn the known result that LRU is a
-reasonable baseline for expert caching. Its value is a canonical format, a
-shared memory-accounting basis, and byte/object metric separation that
-inter-paper comparisons today lack.
+v0.1 is methodology and reproducibility infrastructure, not a decision tool or
+a novelty claim. LRU is a reference baseline, not a presumed winner. Recent
+work reports both theoretical support for LRU-like policies and empirical
+improvements from layer-aware variants or LFU; see
+[Cache Management for Mixture-of-Experts LLMs](https://arxiv.org/abs/2509.02408)
+and
+[In-depth Analysis on Caching and Pre-fetching in Mixture of Experts Offloading](https://arxiv.org/abs/2511.05814).
+The value of v0.1 is a canonical format, shared memory accounting, and explicit
+byte/object metrics. Any claim that these fill a literature gap must be
+re-evaluated against current work before publication.
 
 ### Slice 1A — Replay and accounting
 
@@ -109,7 +114,12 @@ solver independently verifies tiny variable-size optima.
 - [ ] Add deterministic synthetic patterns: repetition, uniform random,
   cyclic, changing hotset, variable expert sizes, and adversarial LRU.
 - [ ] Add a `synthetic-100k` reference workload: 100,000 total events, 32
-  layers, 64 experts per layer, routed top-2, and a fixed seed.
+  layers, 64 experts per layer, routed top-2, and one published reference seed
+  for byte-identical regression runs.
+- [ ] Before inspecting policy results, preregister an evaluation matrix with
+  deterministic workload families, 20 fixed seeds for each stochastic family,
+  an ordered set of memory budgets, `total bytes loaded` as the primary cost
+  metric, and the paired comparison procedure used at the milestone gate.
 
 ### Milestone exit criteria
 
@@ -119,12 +129,11 @@ solver independently verifies tiny variable-size optima.
 - Hand-calculated fixtures match simulator output.
 - Classic Belady does not lose to online policies on the same uniform-size
   objective.
-- Online variable-size policy costs are compared with the bounded optimum but
-  are not expected to match it. The most informative v0.1 results are
-  uniform-size (where classic Belady is a true optimum); variable-size results
-  are descriptive only, because general variable-size caching is NP-hard and
-  no scalable optimum is offered in v0.1. Practical lower bounds for large
-  variable-size traces are deferred to research work after v0.1.
+- Online variable-size policy costs remain informative for relative policy
+  comparisons and are checked against the bounded optimum on tiny cases.
+  Because general variable-size caching is NP-hard, v0.1 reports no scalable
+  global-optimality gap for large traces. Practical lower bounds for large
+  variable-size traces remain deferred research work.
 - No scalable greedy policy is presented as the general offline optimum.
 - Reports clearly separate object and byte metrics.
 - On the pinned CI runner, online policies process `synthetic-100k` with peak
@@ -138,26 +147,46 @@ solver independently verifies tiny variable-size optima.
 Stop and assess whether logical comparisons already answer useful questions.
 Do not add storage timing simply to continue the roadmap.
 
-Kill criteria (pre-committed, to defeat continuation bias):
+Every milestone exit criterion above must pass before this gate is evaluated.
+The comparison protocol is committed before any policy result is inspected;
+changing it after that point creates a new protocol revision and restarts the
+evaluation.
 
-- If no online policy differs from LRU by more than 5% on any byte-cost
-  metric at any tested budget on `synthetic-100k`, the field likely does not
-  need this tool — stop.
-- If LRU/LFU/Belady differences are dominated by seed noise on the reference
-  workload, the caching question is mis-posed for this workload — stop or
-  redesign the workload before continuing.
-- If neither kill condition triggers, the gate is passed and M2 may be
-  planned.
+For each stochastic workload-family and budget pair, compare every online
+policy with LRU on the same 20 seeds. For each seed, define percentage reduction
+as `100 * (LRU bytes - policy bytes) / LRU bytes`. Report its median and a 95%
+percentile-bootstrap confidence interval from 10,000 paired-seed resamples,
+using a bootstrap RNG seed published in the preregistered protocol. A material
+improvement requires a median reduction of at least 5%, with a lower confidence
+bound above zero, at two adjacent preregistered budgets. A policy that is worse
+than LRU never satisfies this condition.
 
-The 5% threshold is chosen before measurement; it may be revised only with a
-documented reason and only before any policy result is observed.
+For a deterministic workload family, material improvement requires a reduction
+of at least 5% at two adjacent preregistered budgets, without a confidence
+interval. An isolated single-budget improvement is inconclusive.
 
-### Minimum citable artifact
+Decision criteria (pre-committed to limit continuation bias):
 
-Completing M1 produces the minimum citable contribution of the project: a
-canonical activation-event format and a reproducible policy comparison on
-synthetic traces under byte budgets. If M2 and later never ship, M1 alone is
-a legitimate methodology / tooling contribution and a valid stopping point.
+- If an online policy demonstrates a material improvement, M2 may be planned
+  to test whether the result transfers to one real trace.
+- If the upper confidence bound stays below 5% for every online policy at every
+  preregistered stochastic workload and budget, and no deterministic workload
+  family and budget pair reaches a 5% reduction, stop expanding the
+  online-policy catalog. The operator may close at M1 or plan M2 solely to test
+  whether a real trace changes that conclusion; do not infer that the wider
+  field does not need the tool.
+- If neither condition is satisfied, the policy result is inconclusive. Add
+  preregistered seeds or redesign the workload suite, then rerun the complete
+  protocol before planning M2.
+
+### Minimum standalone artifact
+
+Completing M1 produces a standalone software artifact: a versioned canonical
+activation-event format, deterministic fixtures, and a reproducible policy
+comparison on synthetic traces under byte budgets. Calling it a citable
+research contribution requires a current prior-art review and an archived,
+versioned public release. If later milestones never ship, M1 remains a valid
+stopping point.
 
 ## Milestone 2 — One reproducible real-trace adapter (`v0.2`)
 
@@ -203,13 +232,12 @@ sweeps.
 ## Milestone 3 — Layout-aware storage schedules (`v0.3`)
 
 > **Optional research extension.** Milestones 3–6 are research work, not the
-> canonical path forward. Each gate (M3, M4, M5) may decide to stop and
-> publish the logical simulator (end of M2) as the project's final state.
-> M5 alone — at least 20 randomized runs, multi-OS backends, multi-device,
-> calibration disjoint from held-out replay — is a multi-month research
-> effort and must not be treated as a milestone like the earlier ones. The
-> MoE field shifts architectures and expert layouts every few months, so any
-> plan beyond M2 must be re-estimated at each gate.
+> canonical path forward. The exit decisions after M3, M4, and M5 may stop at
+> the highest completed and validated milestone. M5 alone requires at least 20
+> randomized repetitions per scenario, a second physical device, and strict
+> separation between calibration and held-out replay; a second operating
+> system remains optional. Scope beyond M2 must be re-estimated against current
+> models, datasets, hardware access, and literature at each gate.
 
 **Outcome:** logical misses become inspectable physical read schedules, without
 claiming device latency.
@@ -233,6 +261,12 @@ claiming device latency.
 - Hand-calculated offset and alignment cases pass.
 - Coalescing never changes the logical experts requested.
 - No report labels schedule-derived byte counts as measured time.
+
+### Gate
+
+Stop after M3 if deterministic schedules already answer the layout question.
+Before starting M4, re-estimate the calibration scope, available devices, and
+current literature; do not add timing merely to continue the roadmap.
 
 ## Milestone 4 — Calibrated storage simulation (`v0.4`)
 
