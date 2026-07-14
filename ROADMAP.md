@@ -31,15 +31,16 @@ simulation claims.
 
 - [x] Initialize Git.
 - [x] Use the MIT License for the source code.
-- [ ] Create `moe-sim-core` and a thin `moe-sim-cli`.
-- [ ] Define the canonical activation event and phase semantics.
-- [ ] Define file-order replay and atomic active-set semantics.
+- [x] Create `moe-sim-core`.
+- [ ] Create a thin `moe-sim-cli`.
+- [x] Define the canonical activation event and phase semantics.
+- [x] Define file-order replay and atomic active-set semantics.
 - [ ] Define the minimal expert-size manifest.
 - [ ] Define oversize expert and oversize active-set rejection.
 - [ ] Define run provenance fields and deterministic seed handling.
 - [ ] Add tiny valid and invalid fixtures.
-- [ ] Document error behavior and compatibility rules.
-- [ ] Add impact-scoped format, Clippy, test, and rustdoc checks.
+- [x] Document error behavior and compatibility rules.
+- [x] Add impact-scoped format, Clippy, test, and rustdoc checks.
 - [ ] Pin the reference CI runner used by later resource gates.
 
 ### Exit criteria

@@ -26,8 +26,6 @@ silently choose the interpretation that permits more work.
 
 ## Current workspace facts
 
-- Status: M0.1 (canonical event contract). Introduces `moe-sim-core` crate
-  with Event/Phase types and validation. No CLI yet.
 - Cargo workspace with resolver `3`, edition `2024`, and Rust `1.97.0`.
 - Source license: MIT. Workspace packages are not published by default.
 - The intended initial layout is deliberately small:
@@ -211,8 +209,8 @@ cargo deny check advisories licenses sources
 Cargo aliases in `.cargo/config.toml`: `lint`, `lint-app`, `lint-pedantic`,
 `test-all`, `doc-all`, and `deny-all`.
 
-The workspace is currently empty, so package-level Rust verification is not yet
-meaningful. Do not claim source or test coverage until crates exist.
+Prefer narrow verification commands scoped to the packages that changed.
+Do not claim source or test coverage for packages that do not exist.
 
 ## Verification baseline
 
