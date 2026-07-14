@@ -15,10 +15,8 @@ later validation stages, not assumptions built into the initial result.
 
 ## Status
 
-**Pre-implementation.** This repository currently contains only the project
-definition, the [roadmap](ROADMAP.md), and Rust workspace policy. It does not
-contain source code, a working CLI, dependencies, or published performance
-results.
+**M0.1 slice.** This branch adds `moe-sim-core`, the first crate, with the
+canonical activation event types and atomic-set validation (see roadmap).
 
 ## Why this project
 
