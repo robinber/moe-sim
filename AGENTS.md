@@ -26,8 +26,8 @@ silently choose the interpretation that permits more work.
 
 ## Current workspace facts
 
-- Status: pre-implementation. The repository has no Rust crates, source code,
-  dependencies, working CLI, or published performance results yet.
+- Status: M0.1 (canonical event contract). Introduces `moe-sim-core` crate
+  with Event/Phase types and validation. No CLI yet.
 - Cargo workspace with resolver `3`, edition `2024`, and Rust `1.97.0`.
 - Source license: MIT. Workspace packages are not published by default.
 - The intended initial layout is deliberately small:

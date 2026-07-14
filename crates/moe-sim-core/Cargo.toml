@@ -1,7 +1,7 @@
 [package]
 name = "moe-sim-core"
 version = "0.1.0"
-description = "Core types, validation, and replay engine for moe-sim"
+description = "Core types and validation for canonical events in moe-sim"
 readme = false
 authors = []
 

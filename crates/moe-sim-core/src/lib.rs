@@ -2,4 +2,4 @@
 
 pub mod trace;
 
-pub use trace::{Event, EventError, Phase};
+pub use trace::{Event, EventError, EventParts, Phase};
