@@ -1,15 +1,4 @@
-//! Canonical activation event and phase types.
-//!
-//! These types represent the minimal information required to replay
-//! expert activations in file order.
-//!
-//! ## Invariants
-//!
-//! - `expert_ids` within a single event form one **atomic active set**. All
-//!   experts listed must be resident together.
-//! - Duplicate expert identifiers within one event are invalid.
-//! - The `phase` field preserves explicit prefill/decode boundaries when known.
-//!   `Unknown` must remain explicit; it is never inferred.
+//! Canonical activation event and phase types with atomic-set validation.
 
 use std::collections::HashSet;
 
@@ -25,46 +14,39 @@ pub enum Phase {
 }
 
 /// A single canonical activation event.
-///
-/// This event records the experts that must be active together for one
-/// atomic step (typically one token at one layer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    /// Identifier of the originating request.
+    /// Originating request identifier.
     pub request_id: u64,
     /// Execution phase.
     pub phase: Phase,
-    /// Monotonic step identifier within the request.
+    /// Step within the request.
     pub step_id: u64,
-    /// Position of the token within the sequence.
+    /// Token position in the sequence.
     pub token_position: u64,
     /// Layer index.
     pub layer_id: u32,
-    /// The experts that must be simultaneously resident for this event.
-    ///
-    /// The list contains no duplicates. The order is preserved from input
-    /// (after validation).
+    /// Experts forming one atomic active set (guaranteed no duplicates).
     pub expert_ids: Vec<u32>,
 }
 
-/// Errors that can occur when constructing or validating an [`Event`].
+/// Errors returned by [`Event`] construction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EventError {
-    /// The same expert identifier appears more than once in a single event.
-    #[error("duplicate expert id {expert_id} within one atomic activation event")]
+    /// Duplicate expert identifier in one event.
+    #[error("duplicate expert id {expert_id} in one activation event")]
     DuplicateExpert {
-        /// The expert identifier that was duplicated.
+        /// The duplicated expert id.
         expert_id: u32,
     },
 }
 
 impl Event {
-    /// Constructs a new event after validating the atomic active set.
+    /// Creates an [`Event`] after validating the atomic expert set.
     ///
     /// # Errors
     ///
-    /// Returns [`EventError::DuplicateExpert`] if `expert_ids` contains
-    /// duplicates.
+    /// Returns [`EventError::DuplicateExpert`] if duplicates are present.
     pub fn new(
         request_id: u64,
         phase: Phase,
