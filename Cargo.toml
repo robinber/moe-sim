@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = []
+members = ["crates/moe-sim-core"]
+
+[workspace.dependencies]
+thiserror = "1"
 
 [workspace.package]
 edition = "2024"

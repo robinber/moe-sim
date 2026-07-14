@@ -1,0 +1,17 @@
+[package]
+name = "moe-sim-core"
+version = "0.1.0"
+description = "Core types, validation, and replay engine for moe-sim"
+readme = false
+authors = []
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
