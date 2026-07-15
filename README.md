@@ -9,14 +9,17 @@ The project answers a deliberately narrow question:
 > how do different caching policies affect misses, bytes loaded, and cache
 > churn?
 
-The first releases will answer this question with a deterministic logical
-simulator. Storage timing, prefetching, compute overlap, and physical replay are
-later validation stages, not assumptions built into the initial result.
+The default path answers this question with a **deterministic logical**
+simulator on synthetic traces. Storage timing, prefetching, compute overlap,
+and physical replay are **optional later experiments**, not part of the
+required journey — see [ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-**M0.1 slice.** This branch adds `moe-sim-core`, the first crate, with the
-canonical activation event types and atomic-set validation (see roadmap).
+**Exploratory / pre-`v0.1`.** Milestone 0.1 landed `moe-sim-core` with canonical
+activation event types and atomic-set validation. The intended useful stop is
+Milestone 1 (`v0.1`): logical cache comparison under byte budgets. Everything
+beyond that is optional curiosity, not a tunnel to finish.
 
 ## Why this project
 
@@ -25,12 +28,13 @@ layer. That sparsity makes out-of-core execution possible, but usefulness
 depends on locality, expert size, memory capacity, storage layout, and the cost
 of bringing missing experts into memory.
 
-Existing runtimes and research simulators often combine several of these
-concerns. `moe-sim` aims to provide a small, standalone test bench where policy
-comparisons use the same trace, memory accounting, and objectives.
+`moe-sim` is a **small personal lab bench**: same traces, same memory
+accounting, same objectives — so policy ideas can be compared honestly without
+standing up an inference runtime.
 
-The project is not an inference engine. It is a tool for deciding which ideas
-are worth validating in one.
+The project is not an inference engine, not a multi-year research program, and
+not obligated to reach a “complete” simulator. Stopping after a clean `v0.1`
+is a successful outcome.
 
 ## Feasible first release
 
@@ -47,13 +51,14 @@ The first useful release (`v0.1`) is limited to:
 - single-run and policy-comparison commands;
 - human-readable, JSON, and CSV reports.
 
-One real dataset adapter is planned for `v0.2`, after its source format, access
-conditions, and reproducibility requirements have been audited. Supporting two
-real datasets is not a prerequisite for the first releases.
+A real dataset adapter (`v0.2`-shaped work) is an **optional** exploration after
+`v0.1`, only if synthetic results still leave an interesting question. It is
+not on the critical path.
 
-## Non-goals for the first releases
+## Non-goals (default path)
 
-The initial project will not:
+Unless an optional exploration deliberately reopens them, this project will
+not:
 
 - execute model weights or tokens;
 - implement attention, KV caches, tokenizers, CUDA kernels, or an HTTP server;
@@ -62,11 +67,12 @@ The initial project will not:
 - model distributed or multi-node systems;
 - implement learned predictors;
 - expose a dynamic plugin ABI;
-- create a large research trace dataset;
-- claim cycle-accurate storage simulation.
+- host large research trace datasets in-repo;
+- claim cycle-accurate storage simulation;
+- treat later roadmap items as mandatory follow-ups.
 
-These exclusions keep the first result testable on a normal development
-machine and prevent the simulator from becoming an inference runtime.
+These exclusions keep exploration cheap on a normal development machine and
+prevent the simulator from becoming an inference runtime or a process tunnel.
 
 ## Core inputs
 
@@ -219,45 +225,39 @@ Large or gated traces will not be committed. Reproducible experiments will
 identify the dataset revision, selected files, checksums, adapter version, and
 transformations applied.
 
-## Storage-aware work comes later
+## Storage-aware work (optional, not scheduled)
 
-Logical misses will eventually be converted into physical read requests using
-file offsets, alignment, and packing information. Only after those schedules
-are correct will the project add:
+Layout-aware reads, device profiles, discrete-event queues, physical replay,
+prefetch, and compute overlap live in the roadmap as **optional explorations**.
+They are interesting research toys if curiosity remains after `v0.1` — not a
+promised second act.
 
-1. measured device profiles;
-2. a discrete-event storage queue;
-3. physical schedule replay;
-4. prefetch and demand-read priorities;
-5. optional compute overlap.
-
-Latency results must identify which inputs are measured, estimated, or
-synthetic. No device profile may be presented as portable across machines.
+If latency experiments ever happen, every result must label inputs as measured,
+estimated, or synthetic. No device profile may be presented as portable across
+machines.
 
 ## Development workflow
 
-Development is intended to be orchestrated with Kira in supervised slices:
+Prefer small, supervised slices (optionally with [Kira](https://github.com/robinber/kira)):
 
-1. the orchestrator proposes a bounded plan;
-2. the operator approves the scope;
-3. one worker implements;
-4. independent workers review correctness and reproducibility;
-5. the orchestrator records evidence and pauses at the next gate.
+1. pick one bounded slice;
+2. implement and review;
+3. close the gate;
+4. **consciously** continue, side-quest, or pause — do not auto-advance the
+   roadmap.
 
-A milestone may require several bounded workflow runs. Each slice uses one run
-and must satisfy its own gate; the milestone closes only after all exit criteria
-in [ROADMAP.md](ROADMAP.md) are demonstrated. Publishing, merging, scope
-expansion, and irreversible actions remain operator decisions.
+Publishing, merging, and scope expansion stay operator decisions. Chaining work
+only to “complete the roadmap” is out of scope for an exploratory project.
 
-## Research positioning
+## Positioning
 
-The intended contribution is a reusable framework for fair, trace-driven
-comparison of MoE cache policies under explicit byte budgets, later extended
-with calibrated single-node storage behavior.
+The intended artifact is a reusable, honest comparison bench for MoE cache
+policies under explicit byte budgets — useful first for the author, optionally
+for others.
 
-Any claim of novelty must be re-evaluated against current literature before
-publication. Early releases should make narrower engineering claims about
-correctness, reproducibility, and measured validation.
+Early work should claim correctness and reproducibility on synthetic fixtures,
+not novelty. Any publication-shaped claim needs a fresh prior-art review; none
+of that is required to enjoy or stop the project.
 
 ## License
 
