@@ -238,16 +238,16 @@ machines.
 
 ## Development workflow
 
-Prefer small, supervised slices (optionally with [Kira](https://github.com/robinber/kira)):
+Prefer small, bounded slices:
 
-1. pick one bounded slice;
+1. pick one slice with a clear stop condition;
 2. implement and review;
-3. close the gate;
+3. close the gate with tests or fixtures that prove it;
 4. **consciously** continue, side-quest, or pause — do not auto-advance the
    roadmap.
 
-Publishing, merging, and scope expansion stay operator decisions. Chaining work
-only to “complete the roadmap” is out of scope for an exploratory project.
+Chaining work only to “complete the roadmap” is out of scope for an exploratory
+project.
 
 ## Positioning
 

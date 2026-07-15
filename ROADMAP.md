@@ -291,21 +291,21 @@ Move an idea into an optional exploration only when you are ready to open a
 
 ---
 
-## How to use Kira with this project
+## How to work in slices
 
-Kira is optional help for **bounded slices**, not a mandate to industrialize
-the roadmap.
+Keep development in **bounded slices**. This is process hygiene for an
+exploratory project, not a mandate to industrialize the backlog.
 
 Suggested rhythm:
 
-1. Pick **one** slice (e.g. M1 / 1A).
-2. Operator approves a narrow plan.
+1. Pick **one** slice (e.g. M1 / 1A) with a clear stop condition.
+2. Keep the plan narrow enough to review in one sitting.
 3. Implement + review.
-4. Record evidence; **stop** at the slice gate.
+4. Prove the gate with tests or hand-calculated fixtures; **stop** there.
 5. Consciously choose: next slice, optional exploration, or pause the project.
 
-Do not chain autonomous runs that “complete the roadmap.” Exploration dies when
-every session is forced to advance a milestone counter.
+Do not chain work only to “complete the roadmap.” Exploration dies when every
+session is forced to advance a milestone counter.
 
 ---
 

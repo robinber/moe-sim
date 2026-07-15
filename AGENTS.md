@@ -87,7 +87,7 @@ use stronger assertions and intentional panics when they improve diagnostics.
 Preferred patterns:
 
 - Use `thiserror` for library errors. Use `anyhow` only in binaries and
-  top-level orchestration.
+  application entrypoints.
 - Return typed, actionable errors for malformed traces, incompatible
   configurations, and unsupported comparisons.
 - Keep `main.rs` thin; put behavior in testable modules.
@@ -265,26 +265,21 @@ For a bug:
 3. Apply the smallest fix.
 4. Verify the original failure and relevant neighboring invariants.
 
-## Kira orchestration
+## Working in slices
 
-When work is coordinated through Kira, use supervised, traceable slices — as a
-way to stay small, not to industrialize the backlog:
+Stay small. Prefer one bounded slice tied to an **active** goal (default path
+M0/M1, or one chosen optional exploration):
 
-1. The orchestrator proposes one bounded slice tied to an **active** goal
-   (default path M0/M1, or one chosen optional exploration).
-2. The operator approves scope before worker dispatch.
-3. One worker owns implementation unless the slice has genuinely independent
-   workstreams.
-4. Independent reviewers assess correctness and reproducibility when useful.
-5. The orchestrator records prompts, captures, commands, results, decisions,
-   and remaining gaps on the workflow thread.
-6. Pause for operator judgment before scope expansion, merge, publication, or
-   any irreversible action. Default after a closed gate: **pause and re-decide**,
-   not “start the next milestone.”
+1. State the slice and its stop condition before coding.
+2. Implement the smallest change that meets the gate.
+3. Prove correctness and reproducibility with tests or fixtures when useful.
+4. Record what ran, what passed, and what remains open.
+5. Pause before scope expansion, merge, publication, or any irreversible
+   action. Default after a closed gate: **pause and re-decide**, not “start the
+   next milestone.”
 
-Do not treat worker completion as proof that a gate passed. Close a slice only
-from reviewable evidence. Prefer several small runs over one long autonomous
-march through the roadmap.
+Close a slice only from reviewable evidence. Prefer several small changes over
+one long march through the roadmap.
 
 ## Research and public claims
 
