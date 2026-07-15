@@ -311,7 +311,7 @@ session is forced to advance a milestone counter.
 
 ## Next planning target
 
-**Current focus:** finish **Milestone 0** contracts (manifest, fixtures, CLI
+**Current focus:** finish remaining **Milestone 0** contracts (fixtures, CLI
 stub, oversize rejection), then open **Milestone 1 slice 1A** only if still
 interesting.
 

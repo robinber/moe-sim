@@ -105,8 +105,9 @@ invalid.
 ### Model manifest
 
 The first manifest maps each `(layer_id, expert_id)` pair to its stored size in
-bytes. Later versions may add file offsets, alignment, packing, compression,
-and alternative precisions.
+bytes. Sizes must be strictly positive; duplicate keys are invalid; lookups for
+undeclared experts fail rather than inventing a size. Later versions may add
+file offsets, alignment, packing, compression, and alternative precisions.
 
 Separating activation order from expert size prevents object-hit rate from
 hiding expensive misses on larger experts.

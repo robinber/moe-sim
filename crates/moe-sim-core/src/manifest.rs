@@ -4,12 +4,12 @@
 //! pair used by a run must appear in a [`ModelManifest`] with a positive size
 //! in bytes.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::trace::Event;
 
 /// Identifies one expert instance in the model: layer and expert index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpertKey {
     layer_id: u32,
     expert_id: u32,
@@ -51,9 +51,13 @@ pub struct ExpertSizeEntry {
 ///
 /// Construction is fallible: zero sizes and duplicate keys are rejected so
 /// invalid model data cannot enter the simulator.
+///
+/// Sizes are stored in a [`BTreeMap`] so iteration and `Debug` order are
+/// deterministic (layer, then expert), which keeps future provenance dumps and
+/// fixtures stable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelManifest {
-    sizes: HashMap<ExpertKey, u64>,
+    sizes: BTreeMap<ExpertKey, u64>,
 }
 
 /// Errors returned when building a [`ModelManifest`] or looking up sizes.
@@ -75,7 +79,7 @@ pub enum ManifestError {
         /// Expert of the duplicated key.
         expert_id: u32,
     },
-    /// An event referenced an expert that is not present in the manifest.
+    /// A requested expert key is not present in the manifest.
     #[error("unknown expert in model manifest: layer {layer_id} expert {expert_id}")]
     UnknownExpert {
         /// Layer of the missing expert.
@@ -102,7 +106,7 @@ impl ModelManifest {
     pub fn try_from_entries(
         entries: impl IntoIterator<Item = ExpertSizeEntry>,
     ) -> Result<Self, ManifestError> {
-        let mut sizes = HashMap::new();
+        let mut sizes = BTreeMap::new();
         for entry in entries {
             if entry.size_bytes == 0 {
                 return Err(ManifestError::ZeroSize {
@@ -294,6 +298,21 @@ mod tests {
             ManifestError::UnknownExpert {
                 layer_id: 0,
                 expert_id: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn active_set_bytes_rejects_expert_id_only_present_on_other_layer() {
+        // Same expert index on a different layer must not satisfy the lookup.
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 64)]).unwrap();
+        let event = sample_event(1, vec![0]);
+        let err = manifest.active_set_bytes(&event).unwrap_err();
+        assert_eq!(
+            err,
+            ManifestError::UnknownExpert {
+                layer_id: 1,
+                expert_id: 0,
             }
         );
     }
