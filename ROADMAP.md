@@ -75,7 +75,7 @@ simulation claims yet.
 - [ ] Create a thin `moe-sim-cli`.
 - [x] Define the canonical activation event and phase semantics.
 - [x] Define file-order replay and atomic active-set semantics.
-- [ ] Define the minimal expert-size manifest.
+- [x] Define the minimal expert-size manifest.
 - [ ] Define oversize expert and oversize active-set rejection.
 - [ ] Define run provenance fields and deterministic seed handling.
 - [ ] Add tiny valid and invalid fixtures.

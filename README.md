@@ -16,10 +16,11 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-**Exploratory / pre-`v0.1`.** Milestone 0.1 landed `moe-sim-core` with canonical
-activation event types and atomic-set validation. The intended useful stop is
-Milestone 1 (`v0.1`): logical cache comparison under byte budgets. Everything
-beyond that is optional curiosity, not a tunnel to finish.
+**Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
+(atomic-set validation) and an explicit expert-size `ModelManifest`. The
+intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
+byte budgets. Everything beyond that is optional curiosity, not a tunnel to
+finish.
 
 ## Why this project
 
