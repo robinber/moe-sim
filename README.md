@@ -16,10 +16,11 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-**Exploratory / pre-`v0.1`.** Milestone 0.1 landed `moe-sim-core` with canonical
-activation event types and atomic-set validation. The intended useful stop is
-Milestone 1 (`v0.1`): logical cache comparison under byte budgets. Everything
-beyond that is optional curiosity, not a tunnel to finish.
+**Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
+(atomic-set validation) and an explicit expert-size `ModelManifest`. The
+intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
+byte budgets. Everything beyond that is optional curiosity, not a tunnel to
+finish.
 
 ## Why this project
 
@@ -104,8 +105,9 @@ invalid.
 ### Model manifest
 
 The first manifest maps each `(layer_id, expert_id)` pair to its stored size in
-bytes. Later versions may add file offsets, alignment, packing, compression,
-and alternative precisions.
+bytes. Sizes must be strictly positive; duplicate keys are invalid; lookups for
+undeclared experts fail rather than inventing a size. Later versions may add
+file offsets, alignment, packing, compression, and alternative precisions.
 
 Separating activation order from expert size prevents object-hit rate from
 hiding expensive misses on larger experts.
