@@ -9,8 +9,8 @@ to make the engineering, simulation, and verification contracts explicit.
 1. This file — repository-wide agent rules.
 2. [`README.md`](README.md) — product scope, architecture, and correctness
    principles.
-3. [`ROADMAP.md`](ROADMAP.md) — milestone order, entry conditions, and exit
-   gates.
+3. [`ROADMAP.md`](ROADMAP.md) — exploratory stance, default path (M0→M1), and
+   optional later directions (not a mandatory tunnel).
 4. [`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md)
    — required before changing, reviewing, debugging, or claiming verification
    for Rust or Cargo work.
@@ -50,11 +50,15 @@ Do not describe planned commands, crates, formats, or results as implemented.
 
 ## Working rules
 
+- This repository is **exploratory**. Prefer a finished narrow slice over
+  advancing the roadmap. Stopping after `v0.1` is a valid success.
 - Make the smallest change that satisfies the approved request.
-- Work one bounded roadmap slice at a time and satisfy its gate before starting
-  a later slice.
-- Do not implement later-milestone infrastructure early merely because it may
-  eventually be useful.
+- Work one bounded slice at a time and satisfy its gate before starting another.
+- Do **not** auto-chain into the next milestone. After a gate, the operator
+  chooses continue / side quest / pause.
+- Do not implement optional-exploration infrastructure (real datasets, storage
+  timing, prefetch, multi-device calibration) early “because it is on the
+  roadmap.” Those items are a menu, not a queue.
 - Follow existing boundaries before introducing new abstractions.
 - Start with the two planned crates. Add a crate only when it has multiple real
   consumers, requires isolated dependencies or verification, or represents a
@@ -263,21 +267,24 @@ For a bug:
 
 ## Kira orchestration
 
-When work is coordinated through Kira, use supervised, traceable slices:
+When work is coordinated through Kira, use supervised, traceable slices — as a
+way to stay small, not to industrialize the backlog:
 
-1. The orchestrator proposes one bounded slice tied to a roadmap gate.
+1. The orchestrator proposes one bounded slice tied to an **active** goal
+   (default path M0/M1, or one chosen optional exploration).
 2. The operator approves scope before worker dispatch.
 3. One worker owns implementation unless the slice has genuinely independent
    workstreams.
-4. Independent reviewers assess correctness and reproducibility.
+4. Independent reviewers assess correctness and reproducibility when useful.
 5. The orchestrator records prompts, captures, commands, results, decisions,
    and remaining gaps on the workflow thread.
 6. Pause for operator judgment before scope expansion, merge, publication, or
-   any irreversible action.
+   any irreversible action. Default after a closed gate: **pause and re-decide**,
+   not “start the next milestone.”
 
 Do not treat worker completion as proof that a gate passed. Close a slice only
-from reviewable evidence. A milestone may require several workflow runs, but
-each run should remain small enough to inspect and reverse.
+from reviewable evidence. Prefer several small runs over one long autonomous
+march through the roadmap.
 
 ## Research and public claims
 
@@ -295,8 +302,8 @@ each run should remain small enough to inspect and reverse.
 
 Before claiming a change complete, confirm that:
 
-- it belongs to the active roadmap slice;
-- no deferred surface or unnecessary crate was introduced;
+- it belongs to the active slice (not an unrequested later exploration);
+- no deferred / optional-exploration surface or unnecessary crate was introduced;
 - simulation invariants still hold;
 - deterministic and provenance requirements are covered;
 - public items and behavior changes are documented;
