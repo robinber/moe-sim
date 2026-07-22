@@ -672,4 +672,54 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn global_capacity_rejects_positive_manifest_at_zero_budget() {
+        // Rule 6 corollary: any positive-size expert exceeds a zero budget
+        // during the manifest pass (before events are considered).
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 1)]).unwrap();
+        let event = sample_event(0, vec![0]);
+        assert_eq!(
+            manifest.validate_global_capacity(0, std::iter::once(&event)),
+            Err(CapacityError::ExpertExceedsGlobalCapacity {
+                layer_id: 0,
+                expert_id: 0,
+                size_bytes: 1,
+                global_budget_bytes: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_reports_unknown_expert_at_nonzero_event_index() {
+        // ActiveSetBytes must carry the file-order index of the failing event,
+        // not only index 0.
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 50)]).unwrap();
+        let ok_event = event_with_ids(1, 0, 0, 0, vec![0]);
+        let bad_event = event_with_ids(9, 0, 0, 0, vec![0, 7]);
+        let events = [&ok_event, &bad_event];
+        let err = manifest.validate_global_capacity(100, events).unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::ActiveSetBytes {
+                event_index: 1,
+                request_id: 9,
+                layer_id: 0,
+                source: ManifestError::UnknownExpert {
+                    layer_id: 0,
+                    expert_id: 7,
+                },
+            }
+        );
+        // Pin the thiserror source chain for callers using std::error::Error.
+        let source = std::error::Error::source(&err);
+        assert!(source.is_some(), "ActiveSetBytes must expose Error::source");
+        assert_eq!(
+            source.and_then(|s| s.downcast_ref::<ManifestError>()),
+            Some(&ManifestError::UnknownExpert {
+                layer_id: 0,
+                expert_id: 7,
+            })
+        );
+    }
 }
