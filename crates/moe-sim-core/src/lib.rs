@@ -6,5 +6,5 @@
 pub mod manifest;
 pub mod trace;
 
-pub use manifest::{ExpertKey, ExpertSizeEntry, ManifestError, ModelManifest};
+pub use manifest::{CapacityError, ExpertKey, ExpertSizeEntry, ManifestError, ModelManifest};
 pub use trace::{Event, EventError, EventParts, Phase};
