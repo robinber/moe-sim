@@ -60,6 +60,69 @@ pub struct ModelManifest {
     sizes: BTreeMap<ExpertKey, u64>,
 }
 
+/// Errors returned when validating a manifest and events against a capacity
+/// budget.
+///
+/// Capacity feasibility is a property of the `(manifest, budget, trace)`
+/// triple. It is distinct from intrinsic manifest validity, which stays owned
+/// by [`ManifestError`]; underlying lookup or overflow failures are preserved
+/// via a `source` field instead of being flattened.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CapacityError {
+    /// A manifest expert is, on its own, larger than the global budget.
+    #[error(
+        "expert exceeds global capacity: layer {layer_id} expert {expert_id} has size {size_bytes} bytes, global budget is {global_budget_bytes} bytes"
+    )]
+    ExpertExceedsGlobalCapacity {
+        /// Layer of the oversize expert.
+        layer_id: u32,
+        /// Expert whose stored size exceeds the budget.
+        expert_id: u32,
+        /// Stored size of the oversize expert in bytes.
+        size_bytes: u64,
+        /// Global capacity budget in bytes.
+        global_budget_bytes: u64,
+    },
+    /// Calculating an event's active-set byte total failed.
+    ///
+    /// `source` is only ever [`ManifestError::UnknownExpert`] or
+    /// [`ManifestError::ActiveSetBytesOverflow`]. `layer_id` deliberately
+    /// duplicates the layer carried by the source so every event-level error
+    /// exposes uniform diagnostics.
+    #[error(
+        "failed to calculate active-set bytes for event {event_index} (request {request_id}, layer {layer_id}): {source}"
+    )]
+    ActiveSetBytes {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Layer of the failing event.
+        layer_id: u32,
+        /// Underlying lookup or overflow error.
+        source: ManifestError,
+    },
+    /// An event's atomic active set is larger than the global budget.
+    ///
+    /// Because the manifest pass runs first, every member expert individually
+    /// fits the budget; the combined atomic set does not.
+    #[error(
+        "active set exceeds global capacity: event {event_index} request {request_id} layer {layer_id} totals {active_set_bytes} bytes, global budget is {global_budget_bytes} bytes"
+    )]
+    ActiveSetExceedsGlobalCapacity {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Layer of the failing event.
+        layer_id: u32,
+        /// Total stored size of the atomic active set in bytes.
+        active_set_bytes: u64,
+        /// Global capacity budget in bytes.
+        global_budget_bytes: u64,
+    },
+}
+
 /// Errors returned when building a [`ModelManifest`] or looking up sizes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ManifestError {
@@ -180,6 +243,80 @@ impl ModelManifest {
         }
         Ok(total)
     }
+
+    /// Validates this manifest and the supplied events against one global
+    /// budget.
+    ///
+    /// This is a pure feasibility check: no residency mutation, no I/O, no
+    /// reordering of events. Callers must complete this pass before emitting
+    /// simulation results (convention in M0; M1 may enforce structurally).
+    ///
+    /// ## Validation order
+    ///
+    /// 1. **Manifest pass** — every entry in the manifest is checked against
+    ///    `global_budget_bytes`, including experts never referenced by the
+    ///    supplied events. Iteration order is the deterministic `(layer_id,
+    ///    expert_id)` key order of the internal map. The first oversize expert
+    ///    fails. Unreferenced experts are intentional for M0: feasibility is a
+    ///    property of `(manifest, budget)` alone and does not depend on which
+    ///    subset a particular trace activates. Real-data / adapter slices may
+    ///    revisit this strictness.
+    /// 2. **Event pass** — events are visited once in caller-supplied order
+    ///    (file order). Metadata fields such as `step_id` are never used to
+    ///    reorder. Each event's unique `expert_ids` form one atomic set via
+    ///    [`Self::active_set_bytes`].
+    ///
+    /// Exact fit (`size == budget`) is valid. Greater than the budget is
+    /// invalid. A zero budget is valid only when the manifest is empty (the
+    /// expert pass runs first); events may then only use empty active sets.
+    /// Any positive-size expert exceeds a zero budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityError::ExpertExceedsGlobalCapacity`] for the first
+    /// oversize manifest entry in key order.
+    /// Returns [`CapacityError::ActiveSetBytes`] when an event's active-set
+    /// byte calculation fails.
+    /// Returns [`CapacityError::ActiveSetExceedsGlobalCapacity`] when an
+    /// atomic active set is larger than the budget.
+    pub fn validate_global_capacity<'a>(
+        &self,
+        global_budget_bytes: u64,
+        events: impl IntoIterator<Item = &'a Event>,
+    ) -> Result<(), CapacityError> {
+        for (key, &size_bytes) in &self.sizes {
+            if size_bytes > global_budget_bytes {
+                return Err(CapacityError::ExpertExceedsGlobalCapacity {
+                    layer_id: key.layer_id(),
+                    expert_id: key.expert_id(),
+                    size_bytes,
+                    global_budget_bytes,
+                });
+            }
+        }
+
+        for (event_index, event) in events.into_iter().enumerate() {
+            let active_set_bytes =
+                self.active_set_bytes(event)
+                    .map_err(|source| CapacityError::ActiveSetBytes {
+                        event_index,
+                        request_id: event.request_id(),
+                        layer_id: event.layer_id(),
+                        source,
+                    })?;
+            if active_set_bytes > global_budget_bytes {
+                return Err(CapacityError::ActiveSetExceedsGlobalCapacity {
+                    event_index,
+                    request_id: event.request_id(),
+                    layer_id: event.layer_id(),
+                    active_set_bytes,
+                    global_budget_bytes,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -199,11 +336,21 @@ mod tests {
     }
 
     fn sample_event(layer_id: u32, expert_ids: Vec<u32>) -> Event {
+        event_with_ids(1, 0, 0, layer_id, expert_ids)
+    }
+
+    fn event_with_ids(
+        request_id: u64,
+        step_id: u64,
+        token_position: u64,
+        layer_id: u32,
+        expert_ids: Vec<u32>,
+    ) -> Event {
         Event::new(EventParts {
-            request_id: 1,
+            request_id,
             phase: Phase::Decode,
-            step_id: 0,
-            token_position: 0,
+            step_id,
+            token_position,
             layer_id,
             expert_ids,
         })
@@ -324,5 +471,255 @@ mod tests {
         let event = sample_event(0, vec![0, 1]);
         let err = manifest.active_set_bytes(&event).unwrap_err();
         assert_eq!(err, ManifestError::ActiveSetBytesOverflow { layer_id: 0 });
+    }
+
+    #[test]
+    fn global_capacity_accepts_empty_input_at_zero_budget() {
+        let manifest = ModelManifest::try_from_entries([]).unwrap();
+        let events: [&Event; 0] = [];
+        assert_eq!(manifest.validate_global_capacity(0, events), Ok(()));
+    }
+
+    #[test]
+    fn global_capacity_accepts_empty_active_set_at_zero_budget() {
+        let manifest = ModelManifest::try_from_entries([]).unwrap();
+        let event = sample_event(0, vec![]);
+        assert_eq!(
+            manifest.validate_global_capacity(0, std::iter::once(&event)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn global_capacity_accepts_exact_fit_expert_and_active_set() {
+        // global-exact-fit: 40 B + 60 B active set, budget 100 B
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 40), entry(0, 1, 60)]).unwrap();
+        let event = sample_event(0, vec![0, 1]);
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn global_capacity_accepts_nonempty_manifest_without_events() {
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 40), entry(0, 1, 60)]).unwrap();
+        let events: [&Event; 0] = [];
+        assert_eq!(manifest.validate_global_capacity(100, events), Ok(()));
+    }
+
+    #[test]
+    fn global_capacity_rejects_unreferenced_oversize_expert() {
+        // global-oversize-expert: unreferenced 101 B expert, budget 100 B
+        let manifest =
+            ModelManifest::try_from_entries([entry(0, 0, 50), entry(0, 1, 101)]).unwrap();
+        let event = sample_event(0, vec![0]);
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Err(CapacityError::ExpertExceedsGlobalCapacity {
+                layer_id: 0,
+                expert_id: 1,
+                size_bytes: 101,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_prioritizes_referenced_oversize_expert() {
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 101)]).unwrap();
+        let event = sample_event(0, vec![0]);
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Err(CapacityError::ExpertExceedsGlobalCapacity {
+                layer_id: 0,
+                expert_id: 0,
+                size_bytes: 101,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_reports_lowest_oversize_expert_key() {
+        // Two oversize entries; BTreeMap order must report the lowest key.
+        let manifest =
+            ModelManifest::try_from_entries([entry(1, 0, 200), entry(0, 5, 150), entry(0, 1, 120)])
+                .unwrap();
+        let events: [&Event; 0] = [];
+        assert_eq!(
+            manifest.validate_global_capacity(100, events),
+            Err(CapacityError::ExpertExceedsGlobalCapacity {
+                layer_id: 0,
+                expert_id: 1,
+                size_bytes: 120,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_runs_manifest_pass_before_independent_event_failure() {
+        // Unreferenced oversize expert + earlier event with unknown expert →
+        // expert error wins (manifest pass first).
+        let manifest =
+            ModelManifest::try_from_entries([entry(0, 0, 50), entry(9, 9, 200)]).unwrap();
+        let event = sample_event(0, vec![0, 99]);
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Err(CapacityError::ExpertExceedsGlobalCapacity {
+                layer_id: 9,
+                expert_id: 9,
+                size_bytes: 200,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_rejects_oversize_active_set() {
+        // global-oversize-active-set: 60 + 50 = 110 > 100
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 60), entry(0, 1, 50)]).unwrap();
+        let event = event_with_ids(7, 0, 0, 0, vec![0, 1]);
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Err(CapacityError::ActiveSetExceedsGlobalCapacity {
+                event_index: 0,
+                request_id: 7,
+                layer_id: 0,
+                active_set_bytes: 110,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_reports_unknown_expert_with_event_context() {
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 50)]).unwrap();
+        let event = event_with_ids(42, 0, 0, 0, vec![0, 3]);
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Err(CapacityError::ActiveSetBytes {
+                event_index: 0,
+                request_id: 42,
+                layer_id: 0,
+                source: ManifestError::UnknownExpert {
+                    layer_id: 0,
+                    expert_id: 3,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_reports_active_set_overflow_with_event_context() {
+        let manifest =
+            ModelManifest::try_from_entries([entry(0, 0, u64::MAX), entry(0, 1, 1)]).unwrap();
+        let event = event_with_ids(3, 0, 0, 0, vec![0, 1]);
+        assert_eq!(
+            manifest.validate_global_capacity(u64::MAX, std::iter::once(&event)),
+            Err(CapacityError::ActiveSetBytes {
+                event_index: 0,
+                request_id: 3,
+                layer_id: 0,
+                source: ManifestError::ActiveSetBytesOverflow { layer_id: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_rejects_oversize_active_set_in_supplied_order() {
+        // file-order-first-failure: first event ok, second fails; metadata would
+        // sort the failing event first if step_id were used (it must not be).
+        let manifest =
+            ModelManifest::try_from_entries([entry(0, 0, 40), entry(0, 1, 60), entry(0, 2, 70)])
+                .unwrap();
+        let ok_event = event_with_ids(1, 99, 99, 0, vec![0]);
+        let bad_event = event_with_ids(2, 0, 0, 0, vec![1, 2]); // 60+70=130 > 100
+        let events = [&ok_event, &bad_event];
+        assert_eq!(
+            manifest.validate_global_capacity(100, events),
+            Err(CapacityError::ActiveSetExceedsGlobalCapacity {
+                event_index: 1,
+                request_id: 2,
+                layer_id: 0,
+                active_set_bytes: 130,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_uses_event_layer_for_active_set_sizes() {
+        // Same expert_id on two layers with different sizes; only event layer
+        // busts the budget when both experts are activated together.
+        let manifest = ModelManifest::try_from_entries([
+            entry(0, 0, 40),
+            entry(0, 1, 40),
+            entry(1, 0, 60),
+            entry(1, 1, 50),
+        ])
+        .unwrap();
+        let event = event_with_ids(1, 0, 0, 1, vec![0, 1]); // 60+50=110 > 100
+        assert_eq!(
+            manifest.validate_global_capacity(100, std::iter::once(&event)),
+            Err(CapacityError::ActiveSetExceedsGlobalCapacity {
+                event_index: 0,
+                request_id: 1,
+                layer_id: 1,
+                active_set_bytes: 110,
+                global_budget_bytes: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_rejects_positive_manifest_at_zero_budget() {
+        // Rule 6 corollary: any positive-size expert exceeds a zero budget
+        // during the manifest pass (before events are considered).
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 1)]).unwrap();
+        let event = sample_event(0, vec![0]);
+        assert_eq!(
+            manifest.validate_global_capacity(0, std::iter::once(&event)),
+            Err(CapacityError::ExpertExceedsGlobalCapacity {
+                layer_id: 0,
+                expert_id: 0,
+                size_bytes: 1,
+                global_budget_bytes: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn global_capacity_reports_unknown_expert_at_nonzero_event_index() {
+        // ActiveSetBytes must carry the file-order index of the failing event,
+        // not only index 0.
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 50)]).unwrap();
+        let ok_event = event_with_ids(1, 0, 0, 0, vec![0]);
+        let bad_event = event_with_ids(9, 0, 0, 0, vec![0, 7]);
+        let events = [&ok_event, &bad_event];
+        let err = manifest.validate_global_capacity(100, events).unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::ActiveSetBytes {
+                event_index: 1,
+                request_id: 9,
+                layer_id: 0,
+                source: ManifestError::UnknownExpert {
+                    layer_id: 0,
+                    expert_id: 7,
+                },
+            }
+        );
+        // Pin the thiserror source chain for callers using std::error::Error.
+        let source = std::error::Error::source(&err);
+        assert!(source.is_some(), "ActiveSetBytes must expose Error::source");
+        assert_eq!(
+            source.and_then(|s| s.downcast_ref::<ManifestError>()),
+            Some(&ManifestError::UnknownExpert {
+                layer_id: 0,
+                expert_id: 7,
+            })
+        );
     }
 }
