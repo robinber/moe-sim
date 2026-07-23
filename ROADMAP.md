@@ -72,7 +72,7 @@ simulation claims yet.
 - [x] Initialize Git.
 - [x] Use the MIT License for the source code.
 - [x] Create `moe-sim-core`.
-- [ ] Create a thin `moe-sim-cli`.
+- [x] Create a thin `moe-sim-cli`.
 - [x] Define the canonical activation event and phase semantics.
 - [x] Define file-order replay and atomic active-set semantics.
 - [x] Define the minimal expert-size manifest.

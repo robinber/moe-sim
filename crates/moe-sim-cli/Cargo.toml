@@ -13,7 +13,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "moe-sim"
+path = "src/main.rs"
+
 [dependencies]
+clap = { workspace = true }
 moe-sim-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

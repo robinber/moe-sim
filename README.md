@@ -134,26 +134,82 @@ not bypass the cache or partially execute the event.
 
 Every report records its inputs and their versions or checksums.
 
-## Planned CLI
+## CLI
 
-The command names below describe the intended interface; they are not available
-yet.
+Two commands are implemented today: `trace inspect` and `capacity check`.
+Both are flag-driven (no positional arguments), take budgets as plain byte
+counts, print a deterministic report to stdout on success, and report typed
+errors on stderr with a meaningful exit code: `0` success, `2` bad arguments,
+`3` read failure, `4` parse failure, `5` capacity rejection. Failures never
+emit partial stdout.
+
+Inspect a committed trace fixture:
 
 ```bash
-moe-sim trace inspect \
-  --trace fixtures/synthetic/repeating.jsonl
+moe-sim trace inspect --trace fixtures/synthetic/active-set-0-1.jsonl
+```
 
+```text
+status: ok
+trace: fixtures/synthetic/active-set-0-1.jsonl
+events: 2
+requests: 1
+layers: 1
+expert_activations: 3
+phase_prefill: 1
+phase_decode: 1
+phase_unknown: 0
+```
+
+Check capacity feasibility. The first event activates the atomic set `{0, 1}`
+(4 B + 6 B = 10 B), so a 10-byte global budget is an exact fit:
+
+```bash
+moe-sim capacity check \
+  --trace fixtures/synthetic/active-set-0-1.jsonl \
+  --model-manifest fixtures/models/two-experts-4-6.json \
+  --global-budget-bytes 10
+```
+
+```text
+status: ok
+trace: fixtures/synthetic/active-set-0-1.jsonl
+model_manifest: fixtures/models/two-experts-4-6.json
+global_budget_bytes: 10
+events: 2
+manifest_experts: 2
+```
+
+At 9 bytes each expert still fits individually, but the atomic active set does
+not, so the configuration is rejected before any simulation (exit code 5):
+
+```bash
+moe-sim capacity check \
+  --trace fixtures/synthetic/active-set-0-1.jsonl \
+  --model-manifest fixtures/models/two-experts-4-6.json \
+  --global-budget-bytes 9
+```
+
+```text
+error: capacity check failed: active set exceeds global capacity: event 0 request 1 layer 0 totals 10 bytes, global budget is 9 bytes
+```
+
+### Planned commands
+
+`run` and `compare` belong to Milestone 1 and are not available yet:
+
+```bash
 moe-sim run \
-  --trace fixtures/synthetic/repeating.jsonl \
-  --model-manifest fixtures/models/tiny.toml \
-  --memory-budget 64mb \
+  --trace fixtures/synthetic/active-set-0-1.jsonl \
+  --model-manifest fixtures/models/two-experts-4-6.json \
+  --memory-budget-bytes 10 \
   --cache-scope global \
   --policy lru
 
 moe-sim compare \
-  --trace fixtures/synthetic/repeating.jsonl \
-  --model-manifest fixtures/models/tiny.toml \
-  --memory-budgets 16mb,32mb,64mb \
+  --trace fixtures/synthetic/active-set-0-1.jsonl \
+  --model-manifest fixtures/models/two-experts-4-6.json \
+  --memory-budgets-bytes 8,9,10 \
   --cache-scope global \
   --policies lru,lfu,belady
 ```

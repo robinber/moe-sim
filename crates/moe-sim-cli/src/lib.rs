@@ -1,11 +1,15 @@
-//! File-format adapters for moe-sim.
+//! File-format adapters and commands for the `moe-sim` binary.
 //!
-//! This crate owns the wire formats: strict v1 JSONL activation traces and
-//! strict v1 JSON model manifests. Adapters decode wire data, then delegate
-//! all domain validation to the fallible constructors in `moe-sim-core`;
-//! capacity feasibility stays a separate, later check and its errors are
-//! never folded into parse errors.
+//! This crate owns the wire formats — strict v1 JSONL activation traces and
+//! strict v1 JSON model manifests — plus the command-line surface built on
+//! them. Adapters decode wire data, then delegate all domain validation to
+//! the fallible constructors in `moe-sim-core`; capacity feasibility stays a
+//! separate, later check and its errors are never folded into parse errors.
+//! Command orchestration and report rendering live in [`commands`] so the
+//! binary entrypoint stays thin glue.
 
+pub mod cli;
+pub mod commands;
 pub mod manifest_json;
 pub mod trace_jsonl;
 
