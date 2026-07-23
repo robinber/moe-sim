@@ -205,6 +205,16 @@ impl ModelManifest {
         self.sizes.contains_key(&key)
     }
 
+    /// Iterates size entries in ascending `(layer_id, expert_id)` order.
+    ///
+    /// The order is deterministic for equal manifests, so adapters can
+    /// produce byte-identical encodings from equal inputs.
+    pub fn entries(&self) -> impl Iterator<Item = ExpertSizeEntry> + '_ {
+        self.sizes
+            .iter()
+            .map(|(&key, &size_bytes)| ExpertSizeEntry { key, size_bytes })
+    }
+
     /// Stored size in bytes for `key`.
     ///
     /// # Errors
@@ -395,6 +405,21 @@ mod tests {
                 layer_id: 0,
                 expert_id: 1,
             }
+        );
+    }
+
+    #[test]
+    fn entries_iterate_in_sorted_key_order() {
+        // Insertion order is deliberately unsorted; iteration must be
+        // ascending (layer_id, expert_id) regardless.
+        let manifest =
+            ModelManifest::try_from_entries([entry(1, 0, 300), entry(0, 7, 100), entry(0, 2, 200)])
+                .unwrap();
+
+        let entries: Vec<ExpertSizeEntry> = manifest.entries().collect();
+        assert_eq!(
+            entries,
+            vec![entry(0, 2, 200), entry(0, 7, 100), entry(1, 0, 300),]
         );
     }
 
