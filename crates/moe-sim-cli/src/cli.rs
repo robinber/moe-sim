@@ -52,10 +52,11 @@ pub enum PolicyArg {
     /// Retain nothing between events: the baseline every policy is measured
     /// against.
     NoCache,
-    /// Evict the least recently used unpinned expert.
+    /// Evict the least recently used unpinned expert, breaking ties by
+    /// lowest expert key.
     Lru,
     /// Evict the least frequently used unpinned expert, breaking ties by
-    /// least recent use.
+    /// least recent use, then by lowest expert key.
     Lfu,
 }
 

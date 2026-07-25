@@ -23,9 +23,10 @@ use crate::trace::Event;
 
 /// Cache policy applied during replay.
 ///
-/// A policy decides only which resident object is evicted next. It is
-/// independent of the budget it operates under, so the same policy can later
-/// be applied within a different cache scope.
+/// A retaining policy decides only which resident object is evicted next;
+/// [`Policy::NoCache`] retains nothing, so it never faces that decision. A
+/// policy is independent of the budget it operates under, so the same policy
+/// can later be applied within a different cache scope.
 ///
 /// One atomic active set counts as one access, so entries can tie on every
 /// policy criterion. A genuine tie evicts the lowest expert key first: an
@@ -701,6 +702,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_global_cache_distinguishes_equal_expert_ids_across_layers() {
+        // (layer 0, expert 0) and (layer 1, expert 0) are distinct objects
+        // that merely share an expert id. With room for exactly one, the
+        // second activation must be a cold load that evicts the first, not a
+        // hit on an aliased key.
+        let manifest = ModelManifest::try_from_entries([
+            ExpertSizeEntry {
+                key: ExpertKey::new(0, 0),
+                size_bytes: 5,
+            },
+            ExpertSizeEntry {
+                key: ExpertKey::new(1, 0),
+                size_bytes: 5,
+            },
+        ])
+        .unwrap();
+        let on_layer = |layer_id: u32| {
+            Event::new(EventParts {
+                request_id: 1,
+                phase: Phase::Decode,
+                step_id: 0,
+                token_position: 0,
+                layer_id,
+                expert_ids: vec![0],
+            })
+            .unwrap()
+        };
+        let events = [on_layer(0), on_layer(1)];
+
+        let metrics = replay(&manifest, &events, Policy::Lru, 5).unwrap();
+
+        assert_eq!(metrics.object_loads(), 2, "layer 1 expert 0 is cold");
+        assert_eq!(metrics.object_hits(), 0);
+        assert_eq!(metrics.evictions(), 1);
+        assert_eq!(metrics.peak_resident_bytes(), 5);
+    }
+
     // --- policies choose different victims ---
 
     /// `A A A B C A` with room for two 5-byte experts.
@@ -758,6 +797,33 @@ mod tests {
         );
         assert_eq!(metrics.byte_reloads(), 5);
         assert_eq!(metrics.evictions(), 2);
+    }
+
+    #[test]
+    fn lfu_breaks_frequency_ties_by_recency_before_key_order() {
+        // After [0, 1, 1, 0] both experts sit at frequency 2, but 1's last
+        // use is older than 0's. When 2 arrives, LFU must evict 1 (least
+        // recent), not 0 (lowest key): the final event then hits.
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events = [
+            ev(vec![0]),
+            ev(vec![1]),
+            ev(vec![1]),
+            ev(vec![0]),
+            ev(vec![2]),
+            ev(vec![0]),
+        ];
+
+        let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
+
+        assert_eq!(
+            metrics.object_loads(),
+            3,
+            "a key-order tie-break would reload 0"
+        );
+        assert_eq!(metrics.object_hits(), 3);
+        assert_eq!(metrics.object_reloads(), 0);
+        assert_eq!(metrics.evictions(), 1);
     }
 
     #[test]
@@ -959,6 +1025,20 @@ mod tests {
     }
 
     #[test]
+    fn evicted_bytes_report_the_victims_actual_size() {
+        // The 3-byte expert 0 is the LRU victim when 2 arrives; the counter
+        // must report those 3 bytes, not a size correlated with the uniform
+        // 5-byte objects the other fixtures use.
+        let manifest = manifest_of(&[(0, 3), (1, 7), (2, 3)]);
+        let events = [ev(vec![0, 1]), ev(vec![1]), ev(vec![2])];
+
+        let metrics = replay(&manifest, &events, Policy::Lru, 10).unwrap();
+
+        assert_eq!(metrics.evictions(), 1);
+        assert_eq!(metrics.evicted_bytes(), 3);
+    }
+
+    #[test]
     fn cyclic_access_defeats_lru_but_stays_within_capacity() {
         // Classic LRU adversary: cycle through one more object than fits.
         let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
@@ -1120,6 +1200,27 @@ mod tests {
                 ReplayError::CounterOverflow {
                     counter: ReplayCounter::ByteLoads,
                     event_index: 1
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn byte_hit_overflow_is_reported_not_wrapped() {
+        // byte_hits can overflow independently of byte_loads: one load of a
+        // u64::MAX expert, then two hits on it.
+        let manifest = manifest_of(&[(0, u64::MAX)]);
+        let events = [ev(vec![0]), ev(vec![0]), ev(vec![0])];
+
+        let err = replay(&manifest, &events, Policy::Lru, u64::MAX).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ReplayError::CounterOverflow {
+                    counter: ReplayCounter::ByteHits,
+                    event_index: 2
                 }
             ),
             "unexpected error: {err}"
