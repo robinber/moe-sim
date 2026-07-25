@@ -6,17 +6,54 @@
 //!
 //! Each event's unique `expert_ids` form one atomic active set: every member
 //! is made resident together, stays pinned for the whole event, and is
-//! released before the next event begins. No event is ever partially admitted.
+//! released before the next event begins. No event is ever partially admitted,
+//! and no member of the current active set can be evicted to make room for
+//! another member of the same set.
 //!
-//! Replay does not enforce a capacity budget. Feasibility is a property of the
-//! `(manifest, budget, trace)` triple and belongs to
-//! [`ModelManifest::validate_global_capacity`], which callers run first.
-//! Replay reports the residency it observed; it does not police it.
+//! Resident bytes never exceed the supplied budget. When an atomic active set
+//! cannot fit even after evicting everything unpinned, replay fails instead of
+//! bypassing the cache or admitting the event in part.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::manifest::{ManifestError, ModelManifest};
+use crate::manifest::{ExpertKey, ManifestError, ModelManifest};
 use crate::trace::Event;
+
+/// Cache policy applied during replay.
+///
+/// A policy decides only which resident object is evicted next. It is
+/// independent of the budget it operates under, so the same policy can later
+/// be applied within a different cache scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Policy {
+    /// Retain nothing between events.
+    ///
+    /// The baseline every caching policy is measured against: every activation
+    /// is a load, and no object is ever reused across events.
+    NoCache,
+    /// Evict the least recently used unpinned object.
+    Lru,
+    /// Evict the least frequently used unpinned object.
+    ///
+    /// Ties are broken by least recent use, which keeps the choice
+    /// deterministic without biasing eviction toward low expert identifiers.
+    /// A frequency count belongs to a resident entry and restarts when an
+    /// object is admitted again, so a once-hot object does not stay immortal
+    /// after eviction.
+    Lfu,
+}
+
+impl fmt::Display for Policy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::NoCache => "no-cache",
+            Self::Lru => "lru",
+            Self::Lfu => "lfu",
+        };
+        f.write_str(name)
+    }
+}
 
 /// Names the cumulative counter that overflowed during replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,6 +64,18 @@ pub enum ReplayCounter {
     ObjectLoads,
     /// Cumulative bytes loaded.
     ByteLoads,
+    /// Count of activations served from residency.
+    ObjectHits,
+    /// Cumulative bytes served from residency.
+    ByteHits,
+    /// Count of objects loaded again after an earlier eviction.
+    ObjectReloads,
+    /// Cumulative bytes loaded again after an earlier eviction.
+    ByteReloads,
+    /// Count of objects evicted to reclaim capacity.
+    Evictions,
+    /// Cumulative bytes evicted to reclaim capacity.
+    EvictedBytes,
 }
 
 impl fmt::Display for ReplayCounter {
@@ -35,6 +84,12 @@ impl fmt::Display for ReplayCounter {
             Self::Events => "events",
             Self::ObjectLoads => "object_loads",
             Self::ByteLoads => "byte_loads",
+            Self::ObjectHits => "object_hits",
+            Self::ByteHits => "byte_hits",
+            Self::ObjectReloads => "object_reloads",
+            Self::ByteReloads => "byte_reloads",
+            Self::Evictions => "evictions",
+            Self::EvictedBytes => "evicted_bytes",
         };
         f.write_str(name)
     }
@@ -62,6 +117,30 @@ pub enum ReplayError {
         /// Underlying lookup or overflow error.
         source: ManifestError,
     },
+    /// An atomic active set does not fit the budget even with every unpinned
+    /// object evicted.
+    ///
+    /// Callers are expected to run
+    /// [`ModelManifest::validate_global_capacity`] first, which rejects this
+    /// configuration before replay starts. Replay repeats the check rather
+    /// than trusting it, because silently bypassing the cache or admitting
+    /// part of an active set would produce a report describing a run that
+    /// cannot happen.
+    #[error(
+        "active set does not fit the budget: event {event_index} request {request_id} layer {layer_id} needs {active_set_bytes} bytes, budget is {budget_bytes} bytes"
+    )]
+    ActiveSetExceedsCapacity {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Layer of the failing event.
+        layer_id: u32,
+        /// Total stored size of the atomic active set in bytes.
+        active_set_bytes: u64,
+        /// Capacity budget in bytes.
+        budget_bytes: u64,
+    },
     /// A cumulative counter exceeded `u64`.
     ///
     /// Reported instead of wrapping silently: a wrapped metric is a wrong
@@ -87,7 +166,10 @@ pub struct ReplayMetrics {
     byte_loads: u64,
     object_hits: u64,
     byte_hits: u64,
+    object_reloads: u64,
+    byte_reloads: u64,
     evictions: u64,
+    evicted_bytes: u64,
     peak_resident_bytes: u64,
 }
 
@@ -110,16 +192,34 @@ impl ReplayMetrics {
         self.byte_loads
     }
 
-    /// Expert objects satisfied by an already-resident copy.
+    /// Activations served by an already-resident object.
     #[must_use]
     pub fn object_hits(&self) -> u64 {
         self.object_hits
     }
 
-    /// Bytes satisfied by an already-resident copy.
+    /// Bytes served by an already-resident object.
     #[must_use]
     pub fn byte_hits(&self) -> u64 {
         self.byte_hits
+    }
+
+    /// Objects loaded again after an earlier eviction: the churn metric.
+    ///
+    /// This is the share of [`Self::object_loads`] that is rework rather than
+    /// unavoidable cold misses, so `object_loads` equals cold loads plus
+    /// reloads. Neither number is derivable from the hit and eviction
+    /// counters alone.
+    #[must_use]
+    pub fn object_reloads(&self) -> u64 {
+        self.object_reloads
+    }
+
+    /// Bytes loaded again after an earlier eviction: the churn metric in
+    /// bytes.
+    #[must_use]
+    pub fn byte_reloads(&self) -> u64 {
+        self.byte_reloads
     }
 
     /// Resident objects removed to reclaim capacity.
@@ -128,29 +228,36 @@ impl ReplayMetrics {
     /// eviction: eviction is the capacity-driven removal of an object the
     /// policy chose to retain. A policy that retains nothing therefore evicts
     /// nothing, which keeps the no-cache baseline comparable with the caching
-    /// policies that will be measured against it.
+    /// policies measured against it.
     #[must_use]
     pub fn evictions(&self) -> u64 {
         self.evictions
     }
 
+    /// Bytes removed to reclaim capacity.
+    #[must_use]
+    pub fn evicted_bytes(&self) -> u64 {
+        self.evicted_bytes
+    }
+
     /// Largest number of bytes resident at any instant during replay.
     ///
-    /// Residency is sampled while an active set is pinned, which is the only
-    /// moment anything is resident under a no-retention policy.
+    /// Sampled while each atomic active set is pinned, which is when residency
+    /// is at its highest for that event.
     #[must_use]
     pub fn peak_resident_bytes(&self) -> u64 {
         self.peak_resident_bytes
     }
 }
 
-/// Replays `events` against `manifest` with no retention between events.
+/// Replays `events` against `manifest` under `policy` and one global budget.
 ///
-/// This is the baseline every caching policy is measured against. Each event
-/// loads its entire atomic active set, uses it, and releases it, so every
-/// activation is a load and nothing is ever reused:
-/// [`ReplayMetrics::object_hits`], [`ReplayMetrics::byte_hits`], and
-/// [`ReplayMetrics::evictions`] are always zero.
+/// Resident bytes never exceed `global_budget_bytes`. Each event's atomic
+/// active set is made fully resident before the event is accounted, and no
+/// member of that set can be evicted while it is pinned.
+///
+/// [`Policy::NoCache`] retains nothing between events, so it never hits and
+/// never evicts; the budget still bounds each individual active set.
 ///
 /// `events` is iterated once and is never collected internally. The item bound
 /// is `&Event`, so every event must outlive the call and the caller therefore
@@ -162,49 +269,281 @@ impl ReplayMetrics {
 /// Returns [`ReplayError::ActiveSetBytes`] when an event references an expert
 /// the manifest does not declare, or when one active set's byte total
 /// overflows.
+/// Returns [`ReplayError::ActiveSetExceedsCapacity`] when an atomic active set
+/// cannot fit the budget even with every unpinned object evicted.
 /// Returns [`ReplayError::CounterOverflow`] when a cumulative counter exceeds
 /// `u64`.
-pub fn replay_no_cache<'a>(
+pub fn replay<'a>(
     manifest: &ModelManifest,
     events: impl IntoIterator<Item = &'a Event>,
+    policy: Policy,
+    global_budget_bytes: u64,
 ) -> Result<ReplayMetrics, ReplayError> {
     let mut metrics = ReplayMetrics::default();
+    let mut cache = ResidentCache::new(global_budget_bytes);
+    let mut ever_loaded: BTreeSet<ExpertKey> = BTreeSet::new();
 
     for (event_index, event) in events.into_iter().enumerate() {
+        let layer_id = event.layer_id();
         let active_set_bytes =
             manifest
                 .active_set_bytes(event)
                 .map_err(|source| ReplayError::ActiveSetBytes {
                     event_index,
                     request_id: event.request_id(),
-                    layer_id: event.layer_id(),
+                    layer_id,
                     source,
                 })?;
 
         metrics.events = bump(metrics.events, 1, ReplayCounter::Events, event_index)?;
 
-        // One load per member of the atomic set; counting by iteration keeps
-        // the object total exact without a `usize` cast.
-        for _ in event.expert_ids() {
-            metrics.object_loads = bump(
-                metrics.object_loads,
-                1,
-                ReplayCounter::ObjectLoads,
-                event_index,
-            )?;
+        // The whole active set is pinned for this event, so nothing in it can
+        // be chosen as an eviction victim while the set is being assembled.
+        let mut pinned: BTreeSet<ExpertKey> = BTreeSet::new();
+        let mut missing: Vec<(ExpertKey, u64)> = Vec::new();
+        let mut required_bytes: u64 = 0;
+
+        for &expert_id in event.expert_ids() {
+            let key = ExpertKey::new(layer_id, expert_id);
+            let size_bytes =
+                manifest
+                    .size_bytes(key)
+                    .map_err(|source| ReplayError::ActiveSetBytes {
+                        event_index,
+                        request_id: event.request_id(),
+                        layer_id,
+                        source,
+                    })?;
+            pinned.insert(key);
+
+            if cache.contains(key) {
+                metrics.object_hits = bump(
+                    metrics.object_hits,
+                    1,
+                    ReplayCounter::ObjectHits,
+                    event_index,
+                )?;
+                metrics.byte_hits = bump(
+                    metrics.byte_hits,
+                    size_bytes,
+                    ReplayCounter::ByteHits,
+                    event_index,
+                )?;
+            } else {
+                required_bytes = required_bytes.saturating_add(size_bytes);
+                missing.push((key, size_bytes));
+            }
         }
 
+        if !evict_until_fits(
+            &mut cache,
+            &mut metrics,
+            policy,
+            &pinned,
+            required_bytes,
+            event_index,
+        )? {
+            return Err(ReplayError::ActiveSetExceedsCapacity {
+                event_index,
+                request_id: event.request_id(),
+                layer_id,
+                active_set_bytes,
+                budget_bytes: global_budget_bytes,
+            });
+        }
+
+        admit_missing(
+            &mut cache,
+            &mut metrics,
+            &mut ever_loaded,
+            &missing,
+            event_index,
+        )?;
+
+        // The atomic set is now fully resident and pinned: residency peaks here.
+        metrics.peak_resident_bytes = metrics.peak_resident_bytes.max(cache.resident_bytes());
+
+        cache.record_access(&pinned);
+
+        if policy == Policy::NoCache {
+            // Release, not eviction: nothing was retained by choice.
+            cache.clear();
+        }
+    }
+
+    Ok(metrics)
+}
+
+/// Evicts unpinned objects until `required_bytes` fit, counting each eviction.
+///
+/// Returns `false` when every resident object is pinned and the requirement is
+/// still unmet, which means the atomic active set itself cannot fit.
+///
+/// The loop always terminates: only the current active set is pinned, so
+/// eviction candidates run out only once the cache holds nothing else.
+fn evict_until_fits(
+    cache: &mut ResidentCache,
+    metrics: &mut ReplayMetrics,
+    policy: Policy,
+    pinned: &BTreeSet<ExpertKey>,
+    required_bytes: u64,
+    event_index: usize,
+) -> Result<bool, ReplayError> {
+    while cache.free_bytes() < required_bytes {
+        let Some(evicted_bytes) = cache.evict_one(policy, pinned) else {
+            return Ok(false);
+        };
+        metrics.evictions = bump(metrics.evictions, 1, ReplayCounter::Evictions, event_index)?;
+        metrics.evicted_bytes = bump(
+            metrics.evicted_bytes,
+            evicted_bytes,
+            ReplayCounter::EvictedBytes,
+            event_index,
+        )?;
+    }
+    Ok(true)
+}
+
+/// Admits every missing member of an active set, counting loads and splitting
+/// rework from cold misses.
+fn admit_missing(
+    cache: &mut ResidentCache,
+    metrics: &mut ReplayMetrics,
+    ever_loaded: &mut BTreeSet<ExpertKey>,
+    missing: &[(ExpertKey, u64)],
+    event_index: usize,
+) -> Result<(), ReplayError> {
+    for &(key, size_bytes) in missing {
+        cache.admit(key, size_bytes);
+        metrics.object_loads = bump(
+            metrics.object_loads,
+            1,
+            ReplayCounter::ObjectLoads,
+            event_index,
+        )?;
         metrics.byte_loads = bump(
             metrics.byte_loads,
-            active_set_bytes,
+            size_bytes,
             ReplayCounter::ByteLoads,
             event_index,
         )?;
 
-        metrics.peak_resident_bytes = metrics.peak_resident_bytes.max(active_set_bytes);
+        // `insert` reports whether the key is new, so a repeat load is rework
+        // caused by an earlier eviction rather than a cold miss.
+        if !ever_loaded.insert(key) {
+            metrics.object_reloads = bump(
+                metrics.object_reloads,
+                1,
+                ReplayCounter::ObjectReloads,
+                event_index,
+            )?;
+            metrics.byte_reloads = bump(
+                metrics.byte_reloads,
+                size_bytes,
+                ReplayCounter::ByteReloads,
+                event_index,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One resident expert object and the ordering metadata its policy needs.
+#[derive(Debug, Clone, Copy)]
+struct ResidentEntry {
+    size_bytes: u64,
+    frequency: u64,
+    last_used_tick: u64,
+}
+
+/// Byte-bounded set of resident expert objects.
+///
+/// The cache owns residency accounting and victim selection. It does not know
+/// about events or metrics; the replay loop decides when to consult it.
+#[derive(Debug)]
+struct ResidentCache {
+    budget_bytes: u64,
+    resident_bytes: u64,
+    entries: BTreeMap<ExpertKey, ResidentEntry>,
+    tick: u64,
+}
+
+impl ResidentCache {
+    fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            resident_bytes: 0,
+            entries: BTreeMap::new(),
+            tick: 0,
+        }
     }
 
-    Ok(metrics)
+    fn contains(&self, key: ExpertKey) -> bool {
+        self.entries.contains_key(&key)
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    fn free_bytes(&self) -> u64 {
+        self.budget_bytes.saturating_sub(self.resident_bytes)
+    }
+
+    fn admit(&mut self, key: ExpertKey, size_bytes: u64) {
+        // A frequency count belongs to the resident entry, so re-admission
+        // starts from zero instead of resurrecting an old hot count.
+        self.entries.insert(
+            key,
+            ResidentEntry {
+                size_bytes,
+                frequency: 0,
+                last_used_tick: self.tick,
+            },
+        );
+        self.resident_bytes = self.resident_bytes.saturating_add(size_bytes);
+    }
+
+    /// Records one access to every key in `accessed`, in deterministic key
+    /// order, so recency and frequency reflect this event.
+    fn record_access(&mut self, accessed: &BTreeSet<ExpertKey>) {
+        for key in accessed {
+            self.tick = self.tick.saturating_add(1);
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.frequency = entry.frequency.saturating_add(1);
+                entry.last_used_tick = self.tick;
+            }
+        }
+    }
+
+    /// Evicts one unpinned object chosen by `policy`, returning its size.
+    ///
+    /// Returns `None` when every resident object is pinned, which means the
+    /// active set itself cannot fit.
+    fn evict_one(&mut self, policy: Policy, pinned: &BTreeSet<ExpertKey>) -> Option<u64> {
+        let victim = self
+            .entries
+            .iter()
+            .filter(|(key, _)| !pinned.contains(key))
+            .min_by(|(_, left), (_, right)| match policy {
+                Policy::Lfu => left
+                    .frequency
+                    .cmp(&right.frequency)
+                    .then(left.last_used_tick.cmp(&right.last_used_tick)),
+                Policy::Lru | Policy::NoCache => left.last_used_tick.cmp(&right.last_used_tick),
+            })
+            .map(|(key, entry)| (*key, entry.size_bytes))?;
+
+        self.entries.remove(&victim.0);
+        // The entry was accounted on admission, so this cannot underflow.
+        self.resident_bytes = self.resident_bytes.saturating_sub(victim.1);
+        Some(victim.1)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.resident_bytes = 0;
+    }
 }
 
 /// Adds `delta` to `counter_value`, reporting overflow instead of wrapping.
@@ -229,46 +568,50 @@ fn bump(
 )]
 mod tests {
     use super::*;
-    use crate::manifest::{ExpertKey, ExpertSizeEntry};
+    use crate::manifest::ExpertSizeEntry;
     use crate::trace::{EventParts, Phase};
 
-    fn entry(layer_id: u32, expert_id: u32, size_bytes: u64) -> ExpertSizeEntry {
-        ExpertSizeEntry {
-            key: ExpertKey::new(layer_id, expert_id),
-            size_bytes,
-        }
+    /// Builds a single-layer manifest from `(expert_id, size_bytes)` pairs.
+    fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
+        ModelManifest::try_from_entries(experts.iter().map(|&(expert_id, size_bytes)| {
+            ExpertSizeEntry {
+                key: ExpertKey::new(0, expert_id),
+                size_bytes,
+            }
+        }))
+        .unwrap()
     }
 
-    fn event(layer_id: u32, expert_ids: Vec<u32>) -> Event {
+    /// One layer-0 event activating `expert_ids` as an atomic set.
+    fn ev(expert_ids: Vec<u32>) -> Event {
         Event::new(EventParts {
             request_id: 1,
             phase: Phase::Decode,
             step_id: 0,
             token_position: 0,
-            layer_id,
+            layer_id: 0,
             expert_ids,
         })
         .unwrap()
     }
 
-    /// The committed `two-experts-4-6` manifest: layer 0 expert 0 is 4 bytes,
-    /// layer 0 expert 1 is 6 bytes.
+    /// The committed `two-experts-4-6` manifest.
     fn two_experts_4_6() -> ModelManifest {
-        ModelManifest::try_from_entries(vec![entry(0, 0, 4), entry(0, 1, 6)]).unwrap()
+        manifest_of(&[(0, 4), (1, 6)])
     }
+
+    // --- no-cache baseline (slice 1A contract, unchanged) ---
 
     #[test]
     fn no_cache_matches_the_hand_calculated_active_set_fixture() {
-        // Mirrors fixtures/synthetic/active-set-0-1.jsonl against
-        // fixtures/models/two-experts-4-6.json.
-        //
-        // event 0: {0, 1} -> 4 + 6 = 10 bytes, 2 objects
-        // event 1: {1}    ->     6 = 6 bytes,  1 object
-        // totals: 2 events, 3 objects, 16 bytes, peak residency 10
+        // Mirrors fixtures/synthetic/active-set-0-1.jsonl over
+        // fixtures/models/two-experts-4-6.json:
+        //   event 0: {0, 1} -> 4 + 6 = 10 bytes, 2 objects
+        //   event 1: {1}    ->         6 bytes,  1 object
         let manifest = two_experts_4_6();
-        let events = vec![event(0, vec![0, 1]), event(0, vec![1])];
+        let events = [ev(vec![0, 1]), ev(vec![1])];
 
-        let metrics = replay_no_cache(&manifest, &events).unwrap();
+        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         assert_eq!(metrics.events(), 2);
         assert_eq!(metrics.object_loads(), 3);
@@ -279,55 +622,304 @@ mod tests {
     #[test]
     fn no_cache_never_hits_and_never_evicts() {
         let manifest = two_experts_4_6();
-        // The same active set repeated: a caching policy would hit here.
-        let events = vec![event(0, vec![0, 1]), event(0, vec![0, 1])];
+        let events = [ev(vec![0, 1]), ev(vec![0, 1])];
 
-        let metrics = replay_no_cache(&manifest, &events).unwrap();
+        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         assert_eq!(metrics.object_hits(), 0);
         assert_eq!(metrics.byte_hits(), 0);
-        assert_eq!(metrics.evictions(), 0);
+        assert_eq!(metrics.evictions(), 0, "a release is not an eviction");
+        assert_eq!(metrics.evicted_bytes(), 0);
         assert_eq!(metrics.byte_loads(), 20, "every activation reloads");
     }
 
     #[test]
-    fn peak_residency_is_the_largest_active_set_not_the_last() {
+    fn no_cache_churn_counts_every_repeat_activation() {
         let manifest = two_experts_4_6();
-        let events = vec![event(0, vec![0, 1]), event(0, vec![0])];
+        let events = [ev(vec![0, 1]), ev(vec![0, 1])];
 
-        let metrics = replay_no_cache(&manifest, &events).unwrap();
+        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
 
-        assert_eq!(metrics.peak_resident_bytes(), 10);
+        // Second activation of each expert is rework, not a cold miss.
+        assert_eq!(metrics.object_reloads(), 2);
+        assert_eq!(metrics.byte_reloads(), 10);
     }
 
     #[test]
     fn empty_trace_yields_zeroed_metrics() {
-        let manifest = two_experts_4_6();
-
-        let metrics = replay_no_cache(&manifest, &[]).unwrap();
-
+        let no_events: [Event; 0] = [];
+        let metrics = replay(&two_experts_4_6(), &no_events, Policy::Lru, 10).unwrap();
         assert_eq!(metrics, ReplayMetrics::default());
-        assert_eq!(metrics.events(), 0);
-        assert_eq!(metrics.peak_resident_bytes(), 0);
     }
 
     #[test]
     fn empty_active_set_is_an_event_that_loads_nothing() {
-        let manifest = two_experts_4_6();
-        let events = vec![event(0, vec![])];
-
-        let metrics = replay_no_cache(&manifest, &events).unwrap();
+        let metrics = replay(&two_experts_4_6(), &[ev(vec![])], Policy::Lru, 10).unwrap();
 
         assert_eq!(metrics.events(), 1);
         assert_eq!(metrics.object_loads(), 0);
-        assert_eq!(metrics.byte_loads(), 0);
         assert_eq!(metrics.peak_resident_bytes(), 0);
+    }
+
+    // --- retention ---
+
+    #[test]
+    fn caching_policies_serve_a_repeated_active_set_from_residency() {
+        let manifest = two_experts_4_6();
+        let events = [ev(vec![0, 1]), ev(vec![0, 1])];
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+
+            assert_eq!(metrics.object_loads(), 2, "{policy}");
+            assert_eq!(metrics.byte_loads(), 10, "{policy}");
+            assert_eq!(metrics.object_hits(), 2, "{policy}");
+            assert_eq!(metrics.byte_hits(), 10, "{policy}");
+            assert_eq!(metrics.object_reloads(), 0, "{policy}");
+        }
+    }
+
+    // --- policies choose different victims ---
+
+    /// `A A A B C A` with room for two 5-byte experts.
+    ///
+    /// When `C` arrives the cache holds `A` (frequency 3, older) and `B`
+    /// (frequency 1, newer). LFU evicts `B` and keeps `A`; LRU evicts `A`.
+    /// The final `A` therefore hits under LFU and reloads under LRU.
+    fn frequency_versus_recency_trace() -> (ModelManifest, Vec<Event>) {
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events = vec![
+            ev(vec![0]),
+            ev(vec![0]),
+            ev(vec![0]),
+            ev(vec![1]),
+            ev(vec![2]),
+            ev(vec![0]),
+        ];
+        (manifest, events)
+    }
+
+    #[test]
+    fn lfu_keeps_the_frequently_used_object() {
+        let (manifest, events) = frequency_versus_recency_trace();
+
+        let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
+
+        assert_eq!(metrics.events(), 6);
+        assert_eq!(metrics.object_loads(), 3);
+        assert_eq!(metrics.byte_loads(), 15);
+        assert_eq!(metrics.object_hits(), 3);
+        assert_eq!(metrics.byte_hits(), 15);
+        assert_eq!(
+            metrics.object_reloads(),
+            0,
+            "LFU never drops the hot object"
+        );
+        assert_eq!(metrics.evictions(), 1);
+        assert_eq!(metrics.evicted_bytes(), 5);
+    }
+
+    #[test]
+    fn lru_drops_the_frequently_used_object_when_it_ages() {
+        let (manifest, events) = frequency_versus_recency_trace();
+
+        let metrics = replay(&manifest, &events, Policy::Lru, 10).unwrap();
+
+        assert_eq!(metrics.events(), 6);
+        assert_eq!(metrics.object_loads(), 4);
+        assert_eq!(metrics.byte_loads(), 20);
+        assert_eq!(metrics.object_hits(), 2);
+        assert_eq!(
+            metrics.object_reloads(),
+            1,
+            "the aged hot object comes back"
+        );
+        assert_eq!(metrics.byte_reloads(), 5);
+        assert_eq!(metrics.evictions(), 2);
+    }
+
+    #[test]
+    fn lfu_frequency_restarts_after_readmission() {
+        // 0 is hot, then evicted, then re-admitted with a fresh count, so it
+        // loses the next eviction race against the now-hotter 1.
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events = [
+            ev(vec![0]),
+            ev(vec![0]),
+            ev(vec![0]),
+            ev(vec![1]),
+            ev(vec![2]),
+            ev(vec![1]),
+            ev(vec![0]),
+        ];
+
+        let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
+
+        assert!(
+            metrics.object_reloads() >= 1,
+            "an evicted object must not keep its old frequency"
+        );
+    }
+
+    // --- adversarial: atomic pinning ---
+
+    #[test]
+    fn a_pinned_member_survives_even_when_the_policy_would_evict_it() {
+        // Budget holds exactly two 5-byte experts.
+        //   e0 {0, 1}   -> both resident, cache full
+        //   e1 {0, 2}   -> 0 is pinned and is also LRU's natural victim,
+        //                  so 1 must be evicted instead
+        //   e2 {0}      -> hits only if pinning protected 0
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events = [ev(vec![0, 1]), ev(vec![0, 2]), ev(vec![0])];
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+
+            assert_eq!(
+                metrics.object_reloads(),
+                0,
+                "{policy} evicted a pinned member of the active set"
+            );
+            assert_eq!(metrics.evictions(), 1, "{policy}");
+            assert_eq!(metrics.object_loads(), 3, "{policy}");
+        }
+    }
+
+    #[test]
+    fn an_atomic_set_is_never_partially_admitted() {
+        // Both members must be resident together; the budget fits exactly one
+        // pair, so the alternating sets evict each other wholesale.
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5), (3, 5)]);
+        let events = [ev(vec![0, 1]), ev(vec![2, 3]), ev(vec![0, 1])];
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+
+            assert_eq!(metrics.object_loads(), 6, "{policy}");
+            assert_eq!(metrics.evictions(), 4, "{policy}");
+            assert_eq!(metrics.object_reloads(), 2, "{policy}");
+            assert_eq!(metrics.peak_resident_bytes(), 10, "{policy}");
+        }
+    }
+
+    #[test]
+    fn an_active_set_larger_than_the_budget_is_rejected() {
+        let manifest = manifest_of(&[(0, 6), (1, 6)]);
+        let events = [ev(vec![0, 1])];
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let err = replay(&manifest, &events, policy, 10).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ReplayError::ActiveSetExceedsCapacity {
+                        event_index: 0,
+                        active_set_bytes: 12,
+                        budget_bytes: 10,
+                        ..
+                    }
+                ),
+                "{policy}: unexpected error: {err}"
+            );
+        }
+    }
+
+    // --- adversarial: byte capacity ---
+
+    #[test]
+    fn resident_bytes_never_exceed_the_budget() {
+        // Variable sizes, a shifting hot set, and a cyclic tail: residency
+        // must stay within budget for every policy at every budget that can
+        // hold the largest atomic set.
+        let manifest = manifest_of(&[(0, 1), (1, 2), (2, 3), (3, 5), (4, 8)]);
+        let events: Vec<Event> = [
+            vec![0, 1],
+            vec![4],
+            vec![2, 3],
+            vec![0],
+            vec![4],
+            vec![1, 2],
+            vec![3],
+            vec![0, 1],
+            vec![4],
+            vec![2],
+        ]
+        .into_iter()
+        .map(ev)
+        .collect();
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            for budget in [8u64, 9, 12, 19, 100] {
+                let metrics = replay(&manifest, &events, policy, budget).unwrap();
+                assert!(
+                    metrics.peak_resident_bytes() <= budget,
+                    "{policy} at budget {budget}: peak {} exceeded it",
+                    metrics.peak_resident_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cyclic_access_defeats_lru_but_stays_within_capacity() {
+        // Classic LRU adversary: cycle through one more object than fits.
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events: Vec<Event> = (0..9).map(|i| ev(vec![i % 3])).collect();
+
+        let metrics = replay(&manifest, &events, Policy::Lru, 10).unwrap();
+
+        assert_eq!(metrics.object_hits(), 0, "every access misses");
+        assert_eq!(metrics.object_loads(), 9);
+        assert_eq!(metrics.object_reloads(), 6, "all rework after the cold set");
+        assert!(metrics.peak_resident_bytes() <= 10);
+    }
+
+    // --- metric identities and determinism ---
+
+    #[test]
+    fn loads_split_into_cold_misses_and_reloads() {
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events: Vec<Event> = (0..12).map(|i| ev(vec![i % 3])).collect();
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            let cold = metrics.object_loads() - metrics.object_reloads();
+            assert_eq!(cold, 3, "{policy}: one cold miss per distinct expert");
+        }
+    }
+
+    #[test]
+    fn every_activation_is_either_a_hit_or_a_load() {
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let events: Vec<Event> = (0..12).map(|i| ev(vec![i % 3])).collect();
+        let activations = 12;
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            assert_eq!(
+                metrics.object_hits() + metrics.object_loads(),
+                activations,
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_inputs_produce_equal_metrics() {
+        let manifest = manifest_of(&[(0, 3), (1, 5), (2, 7)]);
+        let events: Vec<Event> = (0..20).map(|i| ev(vec![i % 3])).collect();
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let first = replay(&manifest, &events, policy, 10).unwrap();
+            let second = replay(&manifest, &events, policy, 10).unwrap();
+            assert_eq!(first, second, "{policy}");
+        }
     }
 
     #[test]
     fn events_replay_in_supplied_order_regardless_of_metadata() {
         let manifest = two_experts_4_6();
-        // step_id descends while file order ascends; replay must not reorder.
         let descending = |step_id: u64, expert_ids: Vec<u32>| {
             Event::new(EventParts {
                 request_id: 1,
@@ -339,20 +931,21 @@ mod tests {
             })
             .unwrap()
         };
-        let events = vec![descending(9, vec![0, 1]), descending(0, vec![1])];
+        let events = [descending(9, vec![0, 1]), descending(0, vec![1])];
 
-        let metrics = replay_no_cache(&manifest, &events).unwrap();
+        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         assert_eq!(metrics.byte_loads(), 16);
-        assert_eq!(metrics.peak_resident_bytes(), 10);
     }
+
+    // --- errors ---
 
     #[test]
     fn unknown_expert_reports_the_failing_event_position() {
         let manifest = two_experts_4_6();
-        let events = vec![event(0, vec![0]), event(0, vec![7])];
+        let events = [ev(vec![0]), ev(vec![7])];
 
-        let err = replay_no_cache(&manifest, &events).unwrap_err();
+        let err = replay(&manifest, &events, Policy::Lru, 10).unwrap_err();
 
         assert!(
             matches!(
@@ -370,11 +963,10 @@ mod tests {
 
     #[test]
     fn byte_load_overflow_is_reported_not_wrapped() {
-        let manifest =
-            ModelManifest::try_from_entries(vec![entry(0, 0, u64::MAX), entry(0, 1, 1)]).unwrap();
-        let events = vec![event(0, vec![0]), event(0, vec![1])];
+        let manifest = manifest_of(&[(0, u64::MAX), (1, 1)]);
+        let events = [ev(vec![0]), ev(vec![1])];
 
-        let err = replay_no_cache(&manifest, &events).unwrap_err();
+        let err = replay(&manifest, &events, Policy::NoCache, u64::MAX).unwrap_err();
 
         assert!(
             matches!(
@@ -391,9 +983,9 @@ mod tests {
     #[test]
     fn replay_accepts_a_streaming_iterator() {
         let manifest = two_experts_4_6();
-        let events = [event(0, vec![0, 1]), event(0, vec![1])];
+        let events = [ev(vec![0, 1]), ev(vec![1])];
 
-        let streamed = replay_no_cache(&manifest, events.iter()).unwrap();
+        let streamed = replay(&manifest, events.iter(), Policy::NoCache, 10).unwrap();
 
         assert_eq!(streamed.byte_loads(), 16);
     }

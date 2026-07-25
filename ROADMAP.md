@@ -142,10 +142,17 @@ pass — optional if you are not publishing.
 
 ### Slice 1B — Online policies and cache scopes
 
-- [ ] LRU and LFU (policy independent of scope).
-- [ ] One global budget.
-- [ ] Explicit fixed per-layer quotas (sum ≤ total budget).
-- [ ] Object hits, byte hits, loads, evictions, resident bytes, churn.
+- [x] LRU and LFU (policy independent of scope). A policy decides only which
+  unpinned object is evicted next, so the same policy applies unchanged when a
+  scope other than the global budget is added.
+- [x] One global budget.
+- [ ] Explicit fixed per-layer quotas (sum ≤ total budget). Split out as the
+  remaining half of this slice: it adds a configuration surface rather than
+  eviction logic, and the gate below is demonstrable without it.
+- [x] Object hits, byte hits, loads, evictions, resident bytes, churn. Churn is
+  **rework**: loads of an expert loaded earlier in the run and evicted since,
+  so loads split into cold misses plus reloads. Turnover alone would duplicate
+  the eviction counter.
 
 **Gate:** every policy respects atomic pinning and byte capacity on adversarial
 fixtures.

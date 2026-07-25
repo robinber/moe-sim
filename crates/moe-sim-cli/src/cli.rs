@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use moe_sim_core::Policy;
 
 /// Trace-driven simulator for out-of-core Mixture-of-Experts inference.
 #[derive(Debug, Parser)]
@@ -42,11 +43,30 @@ pub enum Command {
 }
 
 /// Cache policy selected for one run.
+///
+/// Mirrors [`moe_sim_core::Policy`] as a command-line surface. The two are
+/// kept separate so argument spelling can change without touching simulation
+/// semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PolicyArg {
     /// Retain nothing between events: the baseline every policy is measured
     /// against.
     NoCache,
+    /// Evict the least recently used unpinned expert.
+    Lru,
+    /// Evict the least frequently used unpinned expert, breaking ties by
+    /// least recent use.
+    Lfu,
+}
+
+impl From<PolicyArg> for Policy {
+    fn from(policy: PolicyArg) -> Self {
+        match policy {
+            PolicyArg::NoCache => Self::NoCache,
+            PolicyArg::Lru => Self::Lru,
+            PolicyArg::Lfu => Self::Lfu,
+        }
+    }
 }
 
 /// Arguments for `moe-sim run`.

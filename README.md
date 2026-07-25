@@ -18,8 +18,9 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 
 **Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
 (atomic-set validation), an explicit expert-size `ModelManifest`, and
-deterministic replay with byte-accurate accounting under the no-cache
-baseline. Caching policies are not implemented yet. The
+deterministic replay with byte-accurate accounting under no-cache, LRU, and
+LFU within one global budget. Per-layer cache scopes are not implemented yet.
+The
 intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
 byte budgets. Everything beyond that is optional curiosity, not a tunnel to
 finish.
@@ -207,9 +208,9 @@ moe-sim capacity check \
 error: capacity check failed: active set exceeds global capacity: event 0 request 1 layer 0 totals 10 bytes, global budget is 9 bytes
 ```
 
-Replay the trace under the no-cache baseline. Nothing is retained between
-events, so every activation is a load and residency peaks at the largest
-atomic active set:
+Replay the trace under one policy. `no-cache` retains nothing between events,
+so every activation is a load and residency peaks at the largest atomic active
+set:
 
 ```bash
 moe-sim run \
@@ -234,17 +235,69 @@ object_loads: 3
 byte_loads: 16
 object_hits: 0
 byte_hits: 0
+object_reloads: 1
+byte_reloads: 6
 evictions: 0
+evicted_bytes: 0
+peak_resident_bytes: 10
+```
+
+`--policy lru` and `--policy lfu` retain experts between events under the same
+byte budget. On this fixture both keep expert 1 resident, turning the second
+event into a 6-byte hit instead of the reload the baseline pays:
+
+```bash
+moe-sim run \
+  --trace fixtures/synthetic/active-set-0-1.jsonl \
+  --model-manifest fixtures/models/two-experts-4-6.json \
+  --global-budget-bytes 10 \
+  --policy lru
+```
+
+```text
+status: ok
+tool_version: 0.1.0
+input_format: v1
+trace: fixtures/synthetic/active-set-0-1.jsonl
+trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
+model_manifest: fixtures/models/two-experts-4-6.json
+model_manifest_sha256: 543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538
+global_budget_bytes: 10
+policy: lru
+events: 2
+object_loads: 2
+byte_loads: 10
+object_hits: 1
+byte_hits: 6
+object_reloads: 0
+byte_reloads: 0
+evictions: 0
+evicted_bytes: 0
 peak_resident_bytes: 10
 ```
 
 Capacity is validated before replay, so an infeasible budget is rejected with
-exit code 5 and no metrics are emitted.
+exit code 5 and no metrics are emitted. Resident bytes never exceed the budget
+under any policy, and no member of the active set can be evicted while its
+event is in flight.
 
-Releasing a pinned active set after its event is **not** an eviction: eviction
-is the capacity-driven removal of an object a policy chose to retain. A policy
-that retains nothing therefore evicts nothing, which keeps this baseline
-comparable with the caching policies measured against it.
+Two metric definitions are worth stating plainly, because comparisons depend
+on them:
+
+**A release is not an eviction.** Eviction is the capacity-driven removal of an
+object a policy chose to retain. A policy that retains nothing therefore evicts
+nothing, which keeps the baseline comparable with the caching policies measured
+against it.
+
+**Churn is rework, not turnover.** `object_reloads` and `byte_reloads` count
+loads of an expert that was loaded earlier in the run and evicted since, so
+`object_loads` splits into unavoidable cold misses plus reloads. That
+separation is what distinguishes a policy that thrashes from one that simply
+faces a large working set.
+
+`lfu` breaks ties by least recent use, and a frequency count belongs to a
+resident entry: it restarts when an object is admitted again, so a once-hot
+expert does not become immortal after eviction.
 
 ### Planned commands
 

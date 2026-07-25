@@ -15,12 +15,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use moe_sim_core::{
-    CapacityError, Event, ModelManifest, Phase, ReplayError, ReplayMetrics, replay_no_cache,
+    CapacityError, Event, ModelManifest, Phase, Policy, ReplayError, ReplayMetrics, replay,
 };
 
 use crate::cli::{
-    CapacityCheckArgs, CapacityCommand, Cli, Command, PolicyArg, RunArgs, TraceCommand,
-    TraceInspectArgs,
+    CapacityCheckArgs, CapacityCommand, Cli, Command, RunArgs, TraceCommand, TraceInspectArgs,
 };
 use crate::provenance::{INPUT_FORMAT_VERSION, sha256_hex, tool_version};
 use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trace_jsonl};
@@ -123,12 +122,22 @@ fn run_replay(args: &RunArgs) -> Result<String, CliError> {
         .validate_global_capacity(args.global_budget_bytes, trace.value.iter())
         .map_err(|source| CliError::Capacity { source })?;
 
-    let metrics = match args.policy {
-        PolicyArg::NoCache => replay_no_cache(&manifest.value, trace.value.iter()),
-    }
+    let policy = Policy::from(args.policy);
+    let metrics = replay(
+        &manifest.value,
+        trace.value.iter(),
+        policy,
+        args.global_budget_bytes,
+    )
     .map_err(|source| CliError::Replay { source })?;
 
-    Ok(render_run(args, &trace.digest, &manifest.digest, &metrics))
+    Ok(render_run(
+        args,
+        policy,
+        &trace.digest,
+        &manifest.digest,
+        &metrics,
+    ))
 }
 
 /// Executes `trace inspect`: read, parse, summarize.
@@ -303,8 +312,12 @@ fn render_capacity_check(
 }
 
 /// Renders the `run` success report.
+///
+/// The policy name comes from the domain type's `Display`, not from `clap`, so
+/// the report contract cannot shift with an argument-parsing detail.
 fn render_run(
     args: &RunArgs,
+    policy: Policy,
     trace_digest: &str,
     manifest_digest: &str,
     metrics: &ReplayMetrics,
@@ -318,37 +331,32 @@ fn render_run(
          model_manifest: {}\n\
          model_manifest_sha256: {manifest_digest}\n\
          global_budget_bytes: {}\n\
-         policy: {}\n\
+         policy: {policy}\n\
          events: {}\n\
          object_loads: {}\n\
          byte_loads: {}\n\
          object_hits: {}\n\
          byte_hits: {}\n\
+         object_reloads: {}\n\
+         byte_reloads: {}\n\
          evictions: {}\n\
+         evicted_bytes: {}\n\
          peak_resident_bytes: {}\n",
         tool_version(),
         args.trace.display(),
         args.model_manifest.display(),
         args.global_budget_bytes,
-        policy_name(args.policy),
         metrics.events(),
         metrics.object_loads(),
         metrics.byte_loads(),
         metrics.object_hits(),
         metrics.byte_hits(),
+        metrics.object_reloads(),
+        metrics.byte_reloads(),
         metrics.evictions(),
+        metrics.evicted_bytes(),
         metrics.peak_resident_bytes(),
     )
-}
-
-/// Stable report name of a policy.
-///
-/// Owned here rather than derived from `clap` so the report contract cannot
-/// shift with an argument-parsing detail.
-fn policy_name(policy: PolicyArg) -> &'static str {
-    match policy {
-        PolicyArg::NoCache => "no-cache",
-    }
 }
 
 #[cfg(test)]
@@ -467,7 +475,7 @@ mod tests {
             trace: PathBuf::from("t.jsonl"),
             model_manifest: PathBuf::from("m.json"),
             global_budget_bytes: 10,
-            policy: PolicyArg::NoCache,
+            policy: crate::cli::PolicyArg::NoCache,
         };
         let manifest = ModelManifest::try_from_entries(vec![
             ExpertSizeEntry {
@@ -484,10 +492,10 @@ mod tests {
             event(1, Phase::Prefill, 0, vec![0, 1]),
             event(1, Phase::Decode, 0, vec![1]),
         ];
-        let metrics = replay_no_cache(&manifest, events.iter()).unwrap();
+        let metrics = replay(&manifest, events.iter(), Policy::NoCache, 10).unwrap();
 
         assert_eq!(
-            render_run(&args, DIGEST, OTHER_DIGEST, &metrics),
+            render_run(&args, Policy::NoCache, DIGEST, OTHER_DIGEST, &metrics),
             format!(
                 "status: ok\n\
              tool_version: {}\n\
@@ -503,11 +511,41 @@ mod tests {
              byte_loads: 16\n\
              object_hits: 0\n\
              byte_hits: 0\n\
+             object_reloads: 1\n\
+             byte_reloads: 6\n\
              evictions: 0\n\
+             evicted_bytes: 0\n\
              peak_resident_bytes: 10\n",
                 tool_version()
             )
         );
+    }
+
+    #[test]
+    fn the_report_names_each_policy_from_the_domain_type() {
+        for (policy, expected) in [
+            (Policy::NoCache, "no-cache"),
+            (Policy::Lru, "lru"),
+            (Policy::Lfu, "lfu"),
+        ] {
+            let args = RunArgs {
+                trace: PathBuf::from("t.jsonl"),
+                model_manifest: PathBuf::from("m.json"),
+                global_budget_bytes: 10,
+                policy: crate::cli::PolicyArg::NoCache,
+            };
+            let rendered = render_run(
+                &args,
+                policy,
+                DIGEST,
+                OTHER_DIGEST,
+                &ReplayMetrics::default(),
+            );
+            assert!(
+                rendered.contains(&format!("policy: {expected}\n")),
+                "{policy} rendered as: {rendered}"
+            );
+        }
     }
 
     #[test]
