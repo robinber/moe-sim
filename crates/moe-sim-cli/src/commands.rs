@@ -6,6 +6,10 @@
 //! trace is read and parsed first, then (for `capacity check`) the manifest,
 //! then the capacity feasibility pass. Equal inputs render byte-identical
 //! reports.
+//!
+//! Every success report opens with provenance: the tool version, the input
+//! contract version, and a SHA-256 digest of each input document beside its
+//! path. See [`crate::provenance`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -15,6 +19,7 @@ use moe_sim_core::{CapacityError, Event, ModelManifest, Phase};
 use crate::cli::{
     CapacityCheckArgs, CapacityCommand, Cli, Command, TraceCommand, TraceInspectArgs,
 };
+use crate::provenance::{INPUT_FORMAT_VERSION, sha256_hex, tool_version};
 use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trace_jsonl};
 
 /// Errors surfaced by the `moe-sim` binary commands.
@@ -89,35 +94,62 @@ pub fn run(cli: &Cli) -> Result<String, CliError> {
 
 /// Executes `trace inspect`: read, parse, summarize.
 fn trace_inspect(args: &TraceInspectArgs) -> Result<String, CliError> {
-    let events = load_trace(&args.trace)?;
-    Ok(render_trace_inspect(&args.trace, &summarize(&events)))
+    let trace = load_trace(&args.trace)?;
+    Ok(render_trace_inspect(
+        &args.trace,
+        &trace.digest,
+        &summarize(&trace.value),
+    ))
 }
 
 /// Executes `capacity check`: read and parse both inputs, then validate.
 fn capacity_check(args: &CapacityCheckArgs) -> Result<String, CliError> {
-    let events = load_trace(&args.trace)?;
+    let trace = load_trace(&args.trace)?;
     let manifest = load_manifest(&args.model_manifest)?;
     manifest
-        .validate_global_capacity(args.global_budget_bytes, events.iter())
+        .value
+        .validate_global_capacity(args.global_budget_bytes, trace.value.iter())
         .map_err(|source| CliError::Capacity { source })?;
-    Ok(render_capacity_check(args, events.len(), manifest.len()))
+    Ok(render_capacity_check(
+        args,
+        &trace.digest,
+        &manifest.digest,
+        trace.value.len(),
+        manifest.value.len(),
+    ))
+}
+
+/// One parsed input document beside the digest of the exact bytes it came from.
+struct Loaded<T> {
+    /// The parsed document.
+    value: T,
+    /// Lowercase hexadecimal SHA-256 of the raw input bytes.
+    digest: String,
 }
 
 /// Reads and parses one strict v1 JSONL trace file.
-fn load_trace(path: &Path) -> Result<Vec<Event>, CliError> {
+fn load_trace(path: &Path) -> Result<Loaded<Vec<Event>>, CliError> {
     let raw = read_input(path)?;
-    parse_trace_jsonl(&raw).map_err(|source| CliError::TraceParse {
+    let value = parse_trace_jsonl(&raw).map_err(|source| CliError::TraceParse {
         path: path.to_path_buf(),
         source,
+    })?;
+    Ok(Loaded {
+        value,
+        digest: sha256_hex(raw.as_bytes()),
     })
 }
 
 /// Reads and parses one strict v1 JSON model manifest file.
-fn load_manifest(path: &Path) -> Result<ModelManifest, CliError> {
+fn load_manifest(path: &Path) -> Result<Loaded<ModelManifest>, CliError> {
     let raw = read_input(path)?;
-    parse_manifest_json(&raw).map_err(|source| CliError::ManifestParse {
+    let value = parse_manifest_json(&raw).map_err(|source| CliError::ManifestParse {
         path: path.to_path_buf(),
         source,
+    })?;
+    Ok(Loaded {
+        value,
+        digest: sha256_hex(raw.as_bytes()),
     })
 }
 
@@ -177,10 +209,13 @@ fn summarize(events: &[Event]) -> TraceSummary {
 }
 
 /// Renders the `trace inspect` success report.
-fn render_trace_inspect(path: &Path, summary: &TraceSummary) -> String {
+fn render_trace_inspect(path: &Path, digest: &str, summary: &TraceSummary) -> String {
     format!(
         "status: ok\n\
+         tool_version: {}\n\
+         input_format: {INPUT_FORMAT_VERSION}\n\
          trace: {}\n\
+         trace_sha256: {digest}\n\
          events: {}\n\
          requests: {}\n\
          layers: {}\n\
@@ -188,6 +223,7 @@ fn render_trace_inspect(path: &Path, summary: &TraceSummary) -> String {
          phase_prefill: {}\n\
          phase_decode: {}\n\
          phase_unknown: {}\n",
+        tool_version(),
         path.display(),
         summary.events,
         summary.requests,
@@ -202,16 +238,23 @@ fn render_trace_inspect(path: &Path, summary: &TraceSummary) -> String {
 /// Renders the `capacity check` success report.
 fn render_capacity_check(
     args: &CapacityCheckArgs,
+    trace_digest: &str,
+    manifest_digest: &str,
     events: usize,
     manifest_experts: usize,
 ) -> String {
     format!(
         "status: ok\n\
+         tool_version: {}\n\
+         input_format: {INPUT_FORMAT_VERSION}\n\
          trace: {}\n\
+         trace_sha256: {trace_digest}\n\
          model_manifest: {}\n\
+         model_manifest_sha256: {manifest_digest}\n\
          global_budget_bytes: {}\n\
          events: {}\n\
          manifest_experts: {}\n",
+        tool_version(),
         args.trace.display(),
         args.model_manifest.display(),
         args.global_budget_bytes,
@@ -229,6 +272,12 @@ mod tests {
     use moe_sim_core::{EventParts, ManifestError};
 
     use super::*;
+
+    // Stand-in digests: rendering must place whatever digest it is given, so
+    // these need not hash the placeholder paths. Real inputs are covered
+    // end-to-end in `tests/cli.rs` against externally computed checksums.
+    const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const OTHER_DIGEST: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     fn event(request_id: u64, phase: Phase, layer_id: u32, expert_ids: Vec<u32>) -> Event {
         Event::new(EventParts {
@@ -278,18 +327,24 @@ mod tests {
             event(1, Phase::Prefill, 0, vec![0, 1]),
             event(1, Phase::Decode, 0, vec![1]),
         ];
-        let rendered = render_trace_inspect(Path::new("t.jsonl"), &summarize(&events));
+        let rendered = render_trace_inspect(Path::new("t.jsonl"), DIGEST, &summarize(&events));
         assert_eq!(
             rendered,
-            "status: ok\n\
+            format!(
+                "status: ok\n\
+             tool_version: {}\n\
+             input_format: v1\n\
              trace: t.jsonl\n\
+             trace_sha256: {DIGEST}\n\
              events: 2\n\
              requests: 1\n\
              layers: 1\n\
              expert_activations: 3\n\
              phase_prefill: 1\n\
              phase_decode: 1\n\
-             phase_unknown: 0\n"
+             phase_unknown: 0\n",
+                tool_version()
+            )
         );
     }
 
@@ -301,13 +356,20 @@ mod tests {
             global_budget_bytes: 10,
         };
         assert_eq!(
-            render_capacity_check(&args, 2, 2),
-            "status: ok\n\
+            render_capacity_check(&args, DIGEST, OTHER_DIGEST, 2, 2),
+            format!(
+                "status: ok\n\
+             tool_version: {}\n\
+             input_format: v1\n\
              trace: t.jsonl\n\
+             trace_sha256: {DIGEST}\n\
              model_manifest: m.json\n\
+             model_manifest_sha256: {OTHER_DIGEST}\n\
              global_budget_bytes: 10\n\
              events: 2\n\
-             manifest_experts: 2\n"
+             manifest_experts: 2\n",
+                tool_version()
+            )
         );
     }
 

@@ -24,6 +24,14 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+// Expected input digests, produced outside this crate with
+// `shasum -a 256 <fixture>`. Pinning externally computed values keeps the
+// provenance contract honest: a report a reader cannot reproduce with a
+// standard tool would fail here.
+const ACTIVE_SET_SHA256: &str = "ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556";
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const TWO_EXPERTS_SHA256: &str = "543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538";
+
 /// Runs the `moe-sim` binary from the workspace root with `args`.
 fn moe_sim(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_moe-sim"))
@@ -56,15 +64,21 @@ fn trace_inspect_summarizes_the_active_set_fixture() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "status: ok\n\
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
          trace: fixtures/synthetic/active-set-0-1.jsonl\n\
+         trace_sha256: {ACTIVE_SET_SHA256}\n\
          events: 2\n\
          requests: 1\n\
          layers: 1\n\
          expert_activations: 3\n\
          phase_prefill: 1\n\
          phase_decode: 1\n\
-         phase_unknown: 0\n"
+         phase_unknown: 0\n",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     assert_eq!(stderr(&output), "");
 }
@@ -80,15 +94,21 @@ fn trace_inspect_of_the_empty_fixture_reports_zero_counts() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "status: ok\n\
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
          trace: fixtures/synthetic/empty.jsonl\n\
+         trace_sha256: {EMPTY_SHA256}\n\
          events: 0\n\
          requests: 0\n\
          layers: 0\n\
          expert_activations: 0\n\
          phase_prefill: 0\n\
          phase_decode: 0\n\
-         phase_unknown: 0\n"
+         phase_unknown: 0\n",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     assert_eq!(stderr(&output), "");
 }
@@ -108,12 +128,19 @@ fn capacity_check_accepts_the_exact_fit_budget_10() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "status: ok\n\
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
          trace: fixtures/synthetic/active-set-0-1.jsonl\n\
+         trace_sha256: {ACTIVE_SET_SHA256}\n\
          model_manifest: fixtures/models/two-experts-4-6.json\n\
+         model_manifest_sha256: {TWO_EXPERTS_SHA256}\n\
          global_budget_bytes: 10\n\
          events: 2\n\
-         manifest_experts: 2\n"
+         manifest_experts: 2\n",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     assert_eq!(stderr(&output), "");
 }
