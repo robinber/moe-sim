@@ -14,12 +14,15 @@ to make the engineering, simulation, and verification contracts explicit.
 4. [`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md)
    — required before changing, reviewing, debugging, or claiming verification
    for Rust or Cargo work.
-5. Rust policy files: [`Cargo.toml`](Cargo.toml),
+5. [`.agents/skills/kira/SKILL.md`](.agents/skills/kira/SKILL.md) — required
+   before opening, dispatching, capturing, or claiming completion for
+   Kira-coordinated multi-agent work.
+6. Rust policy files: [`Cargo.toml`](Cargo.toml),
    [`rust-toolchain.toml`](rust-toolchain.toml),
    [`.cargo/config.toml`](.cargo/config.toml),
    [`.rustfmt.toml`](.rustfmt.toml), [`clippy.toml`](clippy.toml), and
    [`deny.toml`](deny.toml).
-6. Subsystem documentation next to the code being changed.
+7. Subsystem documentation next to the code being changed.
 
 When these documents appear to disagree, stop and surface the conflict. Do not
 silently choose the interpretation that permits more work.
@@ -266,6 +269,10 @@ For a bug:
 4. Verify the original failure and relevant neighboring invariants.
 
 ## Working in slices
+
+Load [`.agents/skills/kira/SKILL.md`](.agents/skills/kira/SKILL.md) for
+project config, agent ids, CLI commands, cold-start, and dispatch patterns.
+When work is coordinated through Kira, use supervised, traceable slices:
 
 Stay small. Prefer one bounded slice tied to an **active** goal (default path
 M0/M1, or one chosen optional exploration):

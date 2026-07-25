@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kira"
+  short_description: "kira-mux multi-agent workspace for moe-sim (open, send, capture, orchestrate)"
+  default_prompt: "Use $kira to open the moe-sim workspace, dispatch work to claude/codex/grok, capture replies, and follow the supervised slice orchestration model."
