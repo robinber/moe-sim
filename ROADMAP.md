@@ -146,9 +146,10 @@ pass — optional if you are not publishing.
   unpinned object is evicted next, so the same policy applies unchanged when a
   scope other than the global budget is added.
 - [x] One global budget.
-- [ ] Explicit fixed per-layer quotas (sum ≤ total budget). Split out as the
-  remaining half of this slice: it adds a configuration surface rather than
-  eviction logic, and the gate below is demonstrable without it.
+- [x] Explicit fixed per-layer quotas (sum ≤ total budget). Delivered as the
+  split-out second half of this slice: one independent cache per quota'd
+  layer, unused quota not shared, and the gate below re-demonstrated per
+  layer on adversarial fixtures.
 - [x] Object hits, byte hits, loads, evictions, resident bytes, churn. Churn is
   **rework**: loads of an expert loaded earlier in the run and no longer
   resident, so loads split into cold misses plus reloads. Turnover alone would
@@ -330,10 +331,9 @@ session is forced to advance a milestone counter.
 
 ## Next planning target
 
-**Current focus:** Milestone 0 is closed and slice 1A shipped. Slice 1B is half
-delivered — LRU and LFU under one global budget — with per-layer quotas the
-remaining half. Open slice 1C only if an offline reference is still
-interesting.
+**Current focus:** Milestone 0 is closed; slices 1A and 1B have shipped —
+no-cache, LRU, and LFU under one global budget or explicit per-layer quotas.
+Open slice 1C only if an offline reference is still interesting.
 
 After any closed slice, the default next action is:
 

@@ -3,7 +3,8 @@
 //! `main` only parses arguments, delegates to [`moe_sim_cli::commands::run`],
 //! and translates the outcome into streams and exit codes: the rendered
 //! report goes to stdout on success (exit 0), the error chain goes to stderr
-//! on failure (exit 3–5), and `clap` reports argument errors itself (exit 2).
+//! on failure (exit 2–6), and `clap` reports spelling and value errors itself
+//! (exit 2).
 
 #![expect(
     unused_crate_dependencies,
