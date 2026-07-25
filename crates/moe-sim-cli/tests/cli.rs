@@ -31,6 +31,10 @@ use std::process::{Command, Output};
 const ACTIVE_SET_SHA256: &str = "ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const TWO_EXPERTS_SHA256: &str = "543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538";
+const TWO_LAYERS_TRACE_SHA256: &str =
+    "35c61891c72dba7d6eeac758215f320afbef900e106646face1c58a3b268f824";
+const TWO_LAYERS_MANIFEST_SHA256: &str =
+    "1c94b98f26c0f18f85a5aaca95b1a2d70ea8a1befeb55d8d8a893e792c0d7596";
 
 /// Runs the `moe-sim` binary from the workspace root with `args`.
 fn moe_sim(args: &[&str]) -> Output {
@@ -146,6 +150,7 @@ fn capacity_check_accepts_the_exact_fit_budget_10() {
          model_manifest: fixtures/models/two-experts-4-6.json\n\
          model_manifest_sha256: {TWO_EXPERTS_SHA256}\n\
          global_budget_bytes: 10\n\
+         cache_scope: global\n\
          events: 2\n\
          manifest_experts: 2\n",
             env!("CARGO_PKG_VERSION")
@@ -186,6 +191,7 @@ fn run_no_cache_matches_the_hand_calculated_fixture() {
          model_manifest: fixtures/models/two-experts-4-6.json\n\
          model_manifest_sha256: {TWO_EXPERTS_SHA256}\n\
          global_budget_bytes: 10\n\
+         cache_scope: global\n\
          policy: no-cache\n\
          events: 2\n\
          object_loads: 3\n\
@@ -665,4 +671,322 @@ fn capacity_check_reports_an_unknown_expert_with_event_context() {
         "error: capacity check failed: failed to calculate active-set bytes for \
          event 0 (request 1, layer 0): unknown expert in model manifest: layer 0 expert 2\n"
     );
+}
+
+// Per-layer quotas (slice 1B, second half).
+
+#[test]
+fn run_per_layer_matches_the_hand_calculated_two_layer_fixture() {
+    // fixtures/synthetic/two-layers.jsonl over two-layers.json, quotas
+    // layer 0: 10, layer 1: 5, total budget 15, LRU:
+    //   event 0  L0 {0, 1} -> loads 4 + 6, layer 0 full
+    //   event 1  L1 {0}    -> loads 5, layer 1 full; total residency peaks at 15
+    //   event 2  L0 {1}    -> 6-byte hit
+    //   event 3  L1 {1}    -> evicts expert (1, 0) inside layer 1, loads 3
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--cache-scope",
+        "per-layer",
+        "--layer-quota-bytes",
+        "0:10",
+        "--layer-quota-bytes",
+        "1:5",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
+         trace: fixtures/synthetic/two-layers.jsonl\n\
+         trace_sha256: {TWO_LAYERS_TRACE_SHA256}\n\
+         model_manifest: fixtures/models/two-layers.json\n\
+         model_manifest_sha256: {TWO_LAYERS_MANIFEST_SHA256}\n\
+         global_budget_bytes: 15\n\
+         cache_scope: per-layer\n\
+         policy: lru\n\
+         events: 4\n\
+         object_loads: 4\n\
+         byte_loads: 18\n\
+         object_hits: 1\n\
+         byte_hits: 6\n\
+         object_reloads: 0\n\
+         byte_reloads: 0\n\
+         evictions: 1\n\
+         evicted_bytes: 5\n\
+         peak_resident_bytes: 15\n\
+         layer 0: quota_bytes: 10, peak_resident_bytes: 10\n\
+         layer 1: quota_bytes: 5, peak_resident_bytes: 5\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn per_layer_peaks_stay_inside_each_quota_for_every_policy() {
+    for policy in ["no-cache", "lru", "lfu"] {
+        let output = moe_sim(&[
+            "run",
+            "--trace",
+            "fixtures/synthetic/two-layers.jsonl",
+            "--model-manifest",
+            "fixtures/models/two-layers.json",
+            "--global-budget-bytes",
+            "15",
+            "--cache-scope",
+            "per-layer",
+            "--layer-quota-bytes",
+            "0:10",
+            "--layer-quota-bytes",
+            "1:5",
+            "--policy",
+            policy,
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{policy}");
+        let report = stdout(&output);
+        let layer_line = |layer: &str| {
+            report
+                .lines()
+                .find(|line| line.starts_with(layer))
+                .unwrap_or_else(|| panic!("{policy}: report has no `{layer}` line:\n{report}"))
+                .to_owned()
+        };
+        let peak_of = |line: &str| -> u64 { line.rsplit(": ").next().unwrap().parse().unwrap() };
+        assert!(peak_of(&layer_line("layer 0:")) <= 10, "{policy}");
+        assert!(peak_of(&layer_line("layer 1:")) <= 5, "{policy}");
+    }
+}
+
+#[test]
+fn capacity_check_accepts_the_per_layer_fixture_quotas() {
+    let output = moe_sim(&[
+        "capacity",
+        "check",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--cache-scope",
+        "per-layer",
+        "--layer-quota-bytes",
+        "0:10",
+        "--layer-quota-bytes",
+        "1:5",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
+         trace: fixtures/synthetic/two-layers.jsonl\n\
+         trace_sha256: {TWO_LAYERS_TRACE_SHA256}\n\
+         model_manifest: fixtures/models/two-layers.json\n\
+         model_manifest_sha256: {TWO_LAYERS_MANIFEST_SHA256}\n\
+         global_budget_bytes: 15\n\
+         cache_scope: per-layer\n\
+         events: 4\n\
+         manifest_experts: 4\n\
+         layer 0: quota_bytes: 10\n\
+         layer 1: quota_bytes: 5\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn a_quota_sum_above_the_total_budget_is_a_capacity_rejection() {
+    let output = moe_sim(&[
+        "capacity",
+        "check",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "14",
+        "--cache-scope",
+        "per-layer",
+        "--layer-quota-bytes",
+        "0:10",
+        "--layer-quota-bytes",
+        "1:5",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: capacity check failed: layer quotas exceed the total budget: \
+         quotas sum to 15 bytes, total budget is 14 bytes\n"
+    );
+}
+
+#[test]
+fn an_active_set_larger_than_its_layer_quota_is_rejected_before_any_run() {
+    // Layer 0's atomic set {0, 1} is 10 bytes; a 9-byte quota rejects it even
+    // though the total budget would hold it.
+    for policy in ["no-cache", "lru", "lfu"] {
+        let output = moe_sim(&[
+            "run",
+            "--trace",
+            "fixtures/synthetic/two-layers.jsonl",
+            "--model-manifest",
+            "fixtures/models/two-layers.json",
+            "--global-budget-bytes",
+            "100",
+            "--cache-scope",
+            "per-layer",
+            "--layer-quota-bytes",
+            "0:9",
+            "--layer-quota-bytes",
+            "1:8",
+            "--policy",
+            policy,
+        ]);
+        assert_eq!(output.status.code(), Some(5), "{policy}");
+        assert_eq!(stdout(&output), "", "{policy} emitted metrics anyway");
+        assert_eq!(
+            stderr(&output),
+            "error: capacity check failed: active set exceeds layer quota: \
+             event 0 request 1 layer 0 totals 10 bytes, layer quota is 9 bytes\n",
+            "{policy}"
+        );
+    }
+}
+
+#[test]
+fn an_activated_layer_without_a_quota_is_a_capacity_rejection() {
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--cache-scope",
+        "per-layer",
+        "--layer-quota-bytes",
+        "0:10",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: capacity check failed: missing layer quota: event 1 (request 1) \
+         activates layer 1, which has no explicit quota\n"
+    );
+}
+
+// Scope and quota flags that contradict each other are argument errors.
+
+#[test]
+fn quotas_under_a_global_scope_are_a_usage_error() {
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--layer-quota-bytes",
+        "0:10",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --layer-quota-bytes requires --cache-scope per-layer\n"
+    );
+}
+
+#[test]
+fn a_per_layer_scope_without_quotas_is_a_usage_error() {
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--cache-scope",
+        "per-layer",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --cache-scope per-layer requires at least one --layer-quota-bytes\n"
+    );
+}
+
+#[test]
+fn a_layer_quoted_twice_is_a_usage_error() {
+    let output = moe_sim(&[
+        "capacity",
+        "check",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--cache-scope",
+        "per-layer",
+        "--layer-quota-bytes",
+        "0:10",
+        "--layer-quota-bytes",
+        "0:5",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: layer 0 has more than one --layer-quota-bytes\n"
+    );
+}
+
+#[test]
+fn a_malformed_quota_pair_is_rejected_by_argument_parsing() {
+    for bad in ["0", "a:5", "0:b", ":5", "0:"] {
+        let output = moe_sim(&[
+            "run",
+            "--trace",
+            "fixtures/synthetic/two-layers.jsonl",
+            "--model-manifest",
+            "fixtures/models/two-layers.json",
+            "--global-budget-bytes",
+            "15",
+            "--cache-scope",
+            "per-layer",
+            "--layer-quota-bytes",
+            bad,
+            "--policy",
+            "lru",
+        ]);
+        assert_eq!(output.status.code(), Some(2), "`{bad}` was accepted");
+        assert_eq!(stdout(&output), "", "`{bad}` emitted a report");
+    }
 }

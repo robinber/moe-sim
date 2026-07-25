@@ -4,7 +4,7 @@
 //! pair used by a run must appear in a [`ModelManifest`] with a positive size
 //! in bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::trace::Event;
 
@@ -120,6 +120,73 @@ pub enum CapacityError {
         active_set_bytes: u64,
         /// Global capacity budget in bytes.
         global_budget_bytes: u64,
+    },
+    /// A per-layer quota references a layer absent from the manifest.
+    #[error("layer quota references unknown layer: layer {layer_id} declares no experts")]
+    QuotaForUnknownLayer {
+        /// Layer named by the quota.
+        layer_id: u32,
+    },
+    /// Summing the per-layer quotas would overflow `u64`.
+    #[error("layer quota sum overflowed u64")]
+    LayerQuotaSumOverflow,
+    /// The per-layer quotas together exceed the total budget.
+    #[error(
+        "layer quotas exceed the total budget: quotas sum to {quota_sum_bytes} bytes, total budget is {total_budget_bytes} bytes"
+    )]
+    LayerQuotaSumExceedsTotalBudget {
+        /// Sum of every declared layer quota in bytes.
+        quota_sum_bytes: u64,
+        /// Total capacity budget in bytes.
+        total_budget_bytes: u64,
+    },
+    /// An activated layer has no explicit quota.
+    ///
+    /// A per-layer cache requires an explicit quota for every simulated
+    /// layer; nothing is inferred for a layer the caller left out.
+    #[error(
+        "missing layer quota: event {event_index} (request {request_id}) activates layer {layer_id}, which has no explicit quota"
+    )]
+    MissingLayerQuota {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Activated layer that has no quota.
+        layer_id: u32,
+    },
+    /// A manifest expert is, on its own, larger than its layer's quota.
+    #[error(
+        "expert exceeds layer quota: layer {layer_id} expert {expert_id} has size {size_bytes} bytes, layer quota is {quota_bytes} bytes"
+    )]
+    ExpertExceedsLayerQuota {
+        /// Layer of the oversize expert.
+        layer_id: u32,
+        /// Expert whose stored size exceeds its layer quota.
+        expert_id: u32,
+        /// Stored size of the oversize expert in bytes.
+        size_bytes: u64,
+        /// Quota of the expert's layer in bytes.
+        quota_bytes: u64,
+    },
+    /// An event's atomic active set is larger than its layer's quota.
+    ///
+    /// Because the manifest pass runs first, every member expert individually
+    /// fits the quota; the combined atomic set does not.
+    #[error(
+        "active set exceeds layer quota: event {event_index} request {request_id} layer {layer_id} totals {active_set_bytes} bytes, layer quota is {quota_bytes} bytes"
+    )]
+    ActiveSetExceedsLayerQuota {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Layer of the failing event.
+        layer_id: u32,
+        /// Total stored size of the atomic active set in bytes.
+        active_set_bytes: u64,
+        /// Quota of the event's layer in bytes.
+        quota_bytes: u64,
     },
 }
 
@@ -321,6 +388,100 @@ impl ModelManifest {
                     layer_id: event.layer_id(),
                     active_set_bytes,
                     global_budget_bytes,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates per-layer quota feasibility for a `(manifest, quotas, trace)`
+    /// triple before any simulation.
+    ///
+    /// A per-layer cache requires an explicit quota for every simulated
+    /// layer; the quotas must sum to no more than `total_budget_bytes`, and
+    /// unused quota is not shared. A quota may name any manifest layer, even
+    /// one the trace never activates; a manifest layer that is neither
+    /// activated nor named by a quota is not simulated and stays unchecked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityError::QuotaForUnknownLayer`] when a quota names a
+    /// layer that declares no experts in this manifest.
+    /// Returns [`CapacityError::LayerQuotaSumOverflow`] when the quota sum
+    /// overflows `u64`, and
+    /// [`CapacityError::LayerQuotaSumExceedsTotalBudget`] when the sum
+    /// exceeds the total budget.
+    /// Returns [`CapacityError::ExpertExceedsLayerQuota`] when a manifest
+    /// expert on a quota'd layer is larger than that quota.
+    /// Returns [`CapacityError::MissingLayerQuota`] when an event activates a
+    /// layer without a quota, [`CapacityError::ActiveSetBytes`] when an
+    /// active-set total cannot be calculated, and
+    /// [`CapacityError::ActiveSetExceedsLayerQuota`] when an atomic active
+    /// set is larger than its layer's quota.
+    pub fn validate_per_layer_capacity<'a>(
+        &self,
+        total_budget_bytes: u64,
+        layer_quota_bytes: &BTreeMap<u32, u64>,
+        events: impl IntoIterator<Item = &'a Event>,
+    ) -> Result<(), CapacityError> {
+        let manifest_layers: BTreeSet<u32> = self.sizes.keys().map(|key| key.layer_id()).collect();
+        for &layer_id in layer_quota_bytes.keys() {
+            if !manifest_layers.contains(&layer_id) {
+                return Err(CapacityError::QuotaForUnknownLayer { layer_id });
+            }
+        }
+
+        let mut quota_sum_bytes: u64 = 0;
+        for &quota in layer_quota_bytes.values() {
+            quota_sum_bytes = quota_sum_bytes
+                .checked_add(quota)
+                .ok_or(CapacityError::LayerQuotaSumOverflow)?;
+        }
+        if quota_sum_bytes > total_budget_bytes {
+            return Err(CapacityError::LayerQuotaSumExceedsTotalBudget {
+                quota_sum_bytes,
+                total_budget_bytes,
+            });
+        }
+
+        for (key, &size_bytes) in &self.sizes {
+            if let Some(&quota_bytes) = layer_quota_bytes.get(&key.layer_id())
+                && size_bytes > quota_bytes
+            {
+                return Err(CapacityError::ExpertExceedsLayerQuota {
+                    layer_id: key.layer_id(),
+                    expert_id: key.expert_id(),
+                    size_bytes,
+                    quota_bytes,
+                });
+            }
+        }
+
+        for (event_index, event) in events.into_iter().enumerate() {
+            let layer_id = event.layer_id();
+            let Some(&quota_bytes) = layer_quota_bytes.get(&layer_id) else {
+                return Err(CapacityError::MissingLayerQuota {
+                    event_index,
+                    request_id: event.request_id(),
+                    layer_id,
+                });
+            };
+            let active_set_bytes =
+                self.active_set_bytes(event)
+                    .map_err(|source| CapacityError::ActiveSetBytes {
+                        event_index,
+                        request_id: event.request_id(),
+                        layer_id,
+                        source,
+                    })?;
+            if active_set_bytes > quota_bytes {
+                return Err(CapacityError::ActiveSetExceedsLayerQuota {
+                    event_index,
+                    request_id: event.request_id(),
+                    layer_id,
+                    active_set_bytes,
+                    quota_bytes,
                 });
             }
         }
@@ -745,6 +906,171 @@ mod tests {
                 layer_id: 0,
                 expert_id: 7,
             })
+        );
+    }
+
+    // --- per-layer capacity validation ---
+
+    /// Layer 0 holds experts 0 (4 B) and 1 (6 B); layer 1 holds experts
+    /// 0 (5 B) and 1 (3 B). Mirrors `fixtures/models/two-layers.json`.
+    fn two_layer_manifest() -> ModelManifest {
+        ModelManifest::try_from_entries([
+            entry(0, 0, 4),
+            entry(0, 1, 6),
+            entry(1, 0, 5),
+            entry(1, 1, 3),
+        ])
+        .unwrap()
+    }
+
+    fn quotas(pairs: &[(u32, u64)]) -> BTreeMap<u32, u64> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn per_layer_capacity_accepts_a_feasible_configuration() {
+        let manifest = two_layer_manifest();
+        let events = [sample_event(0, vec![0, 1]), sample_event(1, vec![0, 1])];
+        assert_eq!(
+            manifest.validate_per_layer_capacity(18, &quotas(&[(0, 10), (1, 8)]), &events),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_rejects_a_quota_for_an_unknown_layer() {
+        let manifest = two_layer_manifest();
+        let no_events: [Event; 0] = [];
+        let err = manifest
+            .validate_per_layer_capacity(100, &quotas(&[(0, 10), (7, 10)]), &no_events)
+            .unwrap_err();
+        assert_eq!(err, CapacityError::QuotaForUnknownLayer { layer_id: 7 });
+    }
+
+    #[test]
+    fn per_layer_capacity_rejects_a_quota_sum_overflow() {
+        let manifest = two_layer_manifest();
+        let no_events: [Event; 0] = [];
+        let err = manifest
+            .validate_per_layer_capacity(u64::MAX, &quotas(&[(0, u64::MAX), (1, 1)]), &no_events)
+            .unwrap_err();
+        assert_eq!(err, CapacityError::LayerQuotaSumOverflow);
+    }
+
+    #[test]
+    fn per_layer_capacity_rejects_a_quota_sum_above_the_total_budget() {
+        let manifest = two_layer_manifest();
+        let no_events: [Event; 0] = [];
+        let err = manifest
+            .validate_per_layer_capacity(17, &quotas(&[(0, 10), (1, 8)]), &no_events)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::LayerQuotaSumExceedsTotalBudget {
+                quota_sum_bytes: 18,
+                total_budget_bytes: 17,
+            }
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_rejects_an_expert_larger_than_its_layer_quota() {
+        // The check covers every manifest expert on a quota'd layer, even
+        // when the trace never activates it.
+        let manifest = two_layer_manifest();
+        let no_events: [Event; 0] = [];
+        let err = manifest
+            .validate_per_layer_capacity(10, &quotas(&[(0, 5)]), &no_events)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::ExpertExceedsLayerQuota {
+                layer_id: 0,
+                expert_id: 1,
+                size_bytes: 6,
+                quota_bytes: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_rejects_an_activated_layer_without_a_quota() {
+        let manifest = two_layer_manifest();
+        let events = [sample_event(0, vec![0]), sample_event(1, vec![0])];
+        let err = manifest
+            .validate_per_layer_capacity(100, &quotas(&[(0, 10)]), &events)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::MissingLayerQuota {
+                event_index: 1,
+                request_id: 1,
+                layer_id: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_rejects_an_active_set_larger_than_its_layer_quota() {
+        // Each member fits the quota alone; the atomic set does not, and the
+        // unused quota of layer 1 must not absorb the excess.
+        let manifest = two_layer_manifest();
+        let events = [sample_event(0, vec![0, 1])];
+        let err = manifest
+            .validate_per_layer_capacity(100, &quotas(&[(0, 8), (1, 8)]), &events)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::ActiveSetExceedsLayerQuota {
+                event_index: 0,
+                request_id: 1,
+                layer_id: 0,
+                active_set_bytes: 10,
+                quota_bytes: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_reports_active_set_lookup_failures() {
+        let manifest = two_layer_manifest();
+        let events = [sample_event(0, vec![0, 9])];
+        let err = manifest
+            .validate_per_layer_capacity(100, &quotas(&[(0, 10)]), &events)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CapacityError::ActiveSetBytes {
+                event_index: 0,
+                request_id: 1,
+                layer_id: 0,
+                source: ManifestError::UnknownExpert {
+                    layer_id: 0,
+                    expert_id: 9,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_ignores_manifest_layers_that_are_not_simulated() {
+        // Layer 1 has neither a quota nor an activation: it is not simulated,
+        // so its experts are not measured against anything.
+        let manifest = two_layer_manifest();
+        let events = [sample_event(0, vec![0, 1])];
+        assert_eq!(
+            manifest.validate_per_layer_capacity(10, &quotas(&[(0, 10)]), &events),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_accepts_a_quota_for_an_unactivated_manifest_layer() {
+        let manifest = two_layer_manifest();
+        let events = [sample_event(0, vec![0])];
+        assert_eq!(
+            manifest.validate_per_layer_capacity(18, &quotas(&[(0, 10), (1, 8)]), &events),
+            Ok(())
         );
     }
 }

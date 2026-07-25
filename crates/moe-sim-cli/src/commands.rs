@@ -12,14 +12,17 @@
 //! path. See [`crate::provenance`].
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use moe_sim_core::{
-    CapacityError, Event, ModelManifest, Phase, Policy, ReplayError, ReplayMetrics, replay,
+    CacheScope, CapacityError, Event, ModelManifest, Phase, Policy, ReplayError, ReplayMetrics,
+    replay,
 };
 
 use crate::cli::{
     CapacityCheckArgs, CapacityCommand, Cli, Command, RunArgs, TraceCommand, TraceInspectArgs,
+    cache_scope,
 };
 use crate::provenance::{INPUT_FORMAT_VERSION, sha256_hex, tool_version};
 use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trace_jsonl};
@@ -27,10 +30,21 @@ use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trac
 /// Errors surfaced by the `moe-sim` binary commands.
 ///
 /// Each variant maps to one process exit code via [`CliError::exit_code`].
-/// Argument errors exit with code 2 but are produced and reported by `clap`
-/// before these commands run, so they have no variant here.
+/// Most argument errors exit with code 2 and are produced and reported by
+/// `clap` before these commands run; [`CliError::Usage`] covers the scope and
+/// quota combinations `clap` cannot express declaratively.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    /// The scope and quota flags contradict each other. Exit code 2.
+    ///
+    /// The rules depend on the value of `--cache-scope`, so they are checked
+    /// here rather than by `clap`: quotas require a per-layer scope, a
+    /// per-layer scope requires quotas, and no layer may be quoted twice.
+    #[error("{message}")]
+    Usage {
+        /// Description of the contradictory flags.
+        message: String,
+    },
     /// An input file could not be read as UTF-8 text (missing path, I/O
     /// failure, or invalid UTF-8). Exit code 3.
     #[error("failed to read input file {}: {source}", path.display())]
@@ -80,11 +94,12 @@ pub enum CliError {
 }
 
 impl CliError {
-    /// Process exit code for this error: 3 read, 4 parse, 5 capacity, 6
-    /// replay.
+    /// Process exit code for this error: 2 usage, 3 read, 4 parse, 5
+    /// capacity, 6 replay.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
+            Self::Usage { .. } => 2,
             Self::Read { .. } => 3,
             Self::TraceParse { .. } | Self::ManifestParse { .. } => 4,
             Self::Capacity { .. } => 5,
@@ -113,26 +128,27 @@ pub fn run(cli: &Cli) -> Result<String, CliError> {
 ///
 /// Capacity is validated before replay so an infeasible configuration is
 /// rejected instead of producing metrics that describe a run which could not
-/// happen.
+/// happen. The scope flags are resolved first: a contradictory combination is
+/// a usage error that never touches the filesystem.
 fn run_replay(args: &RunArgs) -> Result<String, CliError> {
-    let trace = load_trace(&args.trace)?;
-    let manifest = load_manifest(&args.model_manifest)?;
-    manifest
-        .value
-        .validate_global_capacity(args.global_budget_bytes, trace.value.iter())
-        .map_err(|source| CliError::Capacity { source })?;
-
-    let policy = Policy::from(args.policy);
-    let metrics = replay(
-        &manifest.value,
-        trace.value.iter(),
-        policy,
+    let scope = cache_scope(
+        args.cache_scope,
+        &args.layer_quota_bytes,
         args.global_budget_bytes,
     )
-    .map_err(|source| CliError::Replay { source })?;
+    .map_err(|message| CliError::Usage { message })?;
+
+    let trace = load_trace(&args.trace)?;
+    let manifest = load_manifest(&args.model_manifest)?;
+    validate_capacity(&manifest.value, &scope, &trace.value)?;
+
+    let policy = Policy::from(args.policy);
+    let metrics = replay(&manifest.value, trace.value.iter(), policy, &scope)
+        .map_err(|source| CliError::Replay { source })?;
 
     Ok(render_run(
         args,
+        &scope,
         policy,
         &trace.digest,
         &manifest.digest,
@@ -152,19 +168,42 @@ fn trace_inspect(args: &TraceInspectArgs) -> Result<String, CliError> {
 
 /// Executes `capacity check`: read and parse both inputs, then validate.
 fn capacity_check(args: &CapacityCheckArgs) -> Result<String, CliError> {
+    let scope = cache_scope(
+        args.cache_scope,
+        &args.layer_quota_bytes,
+        args.global_budget_bytes,
+    )
+    .map_err(|message| CliError::Usage { message })?;
+
     let trace = load_trace(&args.trace)?;
     let manifest = load_manifest(&args.model_manifest)?;
-    manifest
-        .value
-        .validate_global_capacity(args.global_budget_bytes, trace.value.iter())
-        .map_err(|source| CliError::Capacity { source })?;
+    validate_capacity(&manifest.value, &scope, &trace.value)?;
     Ok(render_capacity_check(
         args,
+        &scope,
         &trace.digest,
         &manifest.digest,
         trace.value.len(),
         manifest.value.len(),
     ))
+}
+
+/// Runs the capacity feasibility pass that matches the selected scope.
+fn validate_capacity(
+    manifest: &ModelManifest,
+    scope: &CacheScope,
+    events: &[Event],
+) -> Result<(), CliError> {
+    match scope {
+        CacheScope::Global { budget_bytes } => {
+            manifest.validate_global_capacity(*budget_bytes, events)
+        }
+        CacheScope::PerLayer {
+            total_budget_bytes,
+            layer_quota_bytes,
+        } => manifest.validate_per_layer_capacity(*total_budget_bytes, layer_quota_bytes, events),
+    }
+    .map_err(|source| CliError::Capacity { source })
 }
 
 /// One parsed input document beside the digest of the exact bytes it came from.
@@ -286,12 +325,13 @@ fn render_trace_inspect(path: &Path, digest: &str, summary: &TraceSummary) -> St
 /// Renders the `capacity check` success report.
 fn render_capacity_check(
     args: &CapacityCheckArgs,
+    scope: &CacheScope,
     trace_digest: &str,
     manifest_digest: &str,
     events: usize,
     manifest_experts: usize,
 ) -> String {
-    format!(
+    let mut report = format!(
         "status: ok\n\
          tool_version: {}\n\
          input_format: {INPUT_FORMAT_VERSION}\n\
@@ -300,6 +340,7 @@ fn render_capacity_check(
          model_manifest: {}\n\
          model_manifest_sha256: {manifest_digest}\n\
          global_budget_bytes: {}\n\
+         cache_scope: {scope}\n\
          events: {}\n\
          manifest_experts: {}\n",
         tool_version(),
@@ -308,21 +349,37 @@ fn render_capacity_check(
         args.global_budget_bytes,
         events,
         manifest_experts,
-    )
+    );
+    if let CacheScope::PerLayer {
+        layer_quota_bytes, ..
+    } = scope
+    {
+        for (layer_id, quota_bytes) in layer_quota_bytes {
+            // fmt::Write to a String is infallible; the Result exists only
+            // for the trait.
+            let _ = writeln!(report, "layer {layer_id}: quota_bytes: {quota_bytes}");
+        }
+    }
+    report
 }
 
 /// Renders the `run` success report.
 ///
-/// The policy name comes from the domain type's `Display`, not from `clap`, so
-/// the report contract cannot shift with an argument-parsing detail.
+/// The policy and scope names come from the domain types' `Display`, not from
+/// `clap`, so the report contract cannot shift with an argument-parsing
+/// detail. Under a per-layer scope the aggregate metrics are followed by one
+/// line per quota'd layer pairing the quota with that cache's high-water
+/// mark, so the per-layer capacity invariant is auditable from the report
+/// itself.
 fn render_run(
     args: &RunArgs,
+    scope: &CacheScope,
     policy: Policy,
     trace_digest: &str,
     manifest_digest: &str,
     metrics: &ReplayMetrics,
 ) -> String {
-    format!(
+    let mut report = format!(
         "status: ok\n\
          tool_version: {}\n\
          input_format: {INPUT_FORMAT_VERSION}\n\
@@ -331,6 +388,7 @@ fn render_run(
          model_manifest: {}\n\
          model_manifest_sha256: {manifest_digest}\n\
          global_budget_bytes: {}\n\
+         cache_scope: {scope}\n\
          policy: {policy}\n\
          events: {}\n\
          object_loads: {}\n\
@@ -356,7 +414,24 @@ fn render_run(
         metrics.evictions(),
         metrics.evicted_bytes(),
         metrics.peak_resident_bytes(),
-    )
+    );
+    if let CacheScope::PerLayer {
+        layer_quota_bytes, ..
+    } = scope
+    {
+        for (layer_id, quota_bytes) in layer_quota_bytes {
+            let peak = metrics
+                .layer_peak_resident_bytes()
+                .get(layer_id)
+                .copied()
+                .unwrap_or(0);
+            let _ = writeln!(
+                report,
+                "layer {layer_id}: quota_bytes: {quota_bytes}, peak_resident_bytes: {peak}"
+            );
+        }
+    }
+    report
 }
 
 #[cfg(test)]
@@ -450,9 +525,12 @@ mod tests {
             trace: PathBuf::from("t.jsonl"),
             model_manifest: PathBuf::from("m.json"),
             global_budget_bytes: 10,
+            cache_scope: crate::cli::CacheScopeArg::Global,
+            layer_quota_bytes: vec![],
         };
+        let scope = CacheScope::Global { budget_bytes: 10 };
         assert_eq!(
-            render_capacity_check(&args, DIGEST, OTHER_DIGEST, 2, 2),
+            render_capacity_check(&args, &scope, DIGEST, OTHER_DIGEST, 2, 2),
             format!(
                 "status: ok\n\
              tool_version: {}\n\
@@ -462,10 +540,36 @@ mod tests {
              model_manifest: m.json\n\
              model_manifest_sha256: {OTHER_DIGEST}\n\
              global_budget_bytes: 10\n\
+             cache_scope: global\n\
              events: 2\n\
              manifest_experts: 2\n",
                 tool_version()
             )
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_check_report_lists_each_quota() {
+        let args = CapacityCheckArgs {
+            trace: PathBuf::from("t.jsonl"),
+            model_manifest: PathBuf::from("m.json"),
+            global_budget_bytes: 15,
+            cache_scope: crate::cli::CacheScopeArg::PerLayer,
+            layer_quota_bytes: vec![(0, 10), (1, 5)],
+        };
+        let scope = CacheScope::PerLayer {
+            total_budget_bytes: 15,
+            layer_quota_bytes: [(0, 10), (1, 5)].into_iter().collect(),
+        };
+        let rendered = render_capacity_check(&args, &scope, DIGEST, OTHER_DIGEST, 4, 4);
+        assert!(rendered.contains("cache_scope: per-layer\n"), "{rendered}");
+        assert!(
+            rendered.ends_with(
+                "manifest_experts: 4\n\
+                 layer 0: quota_bytes: 10\n\
+                 layer 1: quota_bytes: 5\n"
+            ),
+            "{rendered}"
         );
     }
 
@@ -475,8 +579,11 @@ mod tests {
             trace: PathBuf::from("t.jsonl"),
             model_manifest: PathBuf::from("m.json"),
             global_budget_bytes: 10,
+            cache_scope: crate::cli::CacheScopeArg::Global,
+            layer_quota_bytes: vec![],
             policy: crate::cli::PolicyArg::NoCache,
         };
+        let scope = CacheScope::Global { budget_bytes: 10 };
         let manifest = ModelManifest::try_from_entries(vec![
             ExpertSizeEntry {
                 key: ExpertKey::new(0, 0),
@@ -492,10 +599,17 @@ mod tests {
             event(1, Phase::Prefill, 0, vec![0, 1]),
             event(1, Phase::Decode, 0, vec![1]),
         ];
-        let metrics = replay(&manifest, events.iter(), Policy::NoCache, 10).unwrap();
+        let metrics = replay(&manifest, events.iter(), Policy::NoCache, &scope).unwrap();
 
         assert_eq!(
-            render_run(&args, Policy::NoCache, DIGEST, OTHER_DIGEST, &metrics),
+            render_run(
+                &args,
+                &scope,
+                Policy::NoCache,
+                DIGEST,
+                OTHER_DIGEST,
+                &metrics
+            ),
             format!(
                 "status: ok\n\
              tool_version: {}\n\
@@ -505,6 +619,7 @@ mod tests {
              model_manifest: m.json\n\
              model_manifest_sha256: {OTHER_DIGEST}\n\
              global_budget_bytes: 10\n\
+             cache_scope: global\n\
              policy: no-cache\n\
              events: 2\n\
              object_loads: 3\n\
@@ -522,6 +637,56 @@ mod tests {
     }
 
     #[test]
+    fn per_layer_run_report_pairs_each_quota_with_its_peak() {
+        let args = RunArgs {
+            trace: PathBuf::from("t.jsonl"),
+            model_manifest: PathBuf::from("m.json"),
+            global_budget_bytes: 15,
+            cache_scope: crate::cli::CacheScopeArg::PerLayer,
+            layer_quota_bytes: vec![(0, 10), (1, 5)],
+            policy: crate::cli::PolicyArg::Lru,
+        };
+        let scope = CacheScope::PerLayer {
+            total_budget_bytes: 15,
+            layer_quota_bytes: [(0, 10), (1, 5)].into_iter().collect(),
+        };
+        let manifest = ModelManifest::try_from_entries(vec![
+            ExpertSizeEntry {
+                key: ExpertKey::new(0, 0),
+                size_bytes: 4,
+            },
+            ExpertSizeEntry {
+                key: ExpertKey::new(1, 0),
+                size_bytes: 5,
+            },
+        ])
+        .unwrap();
+        let l0 = event(1, Phase::Decode, 0, vec![0]);
+        let l1 = Event::new(EventParts {
+            request_id: 1,
+            phase: Phase::Decode,
+            step_id: 0,
+            token_position: 0,
+            layer_id: 1,
+            expert_ids: vec![0],
+        })
+        .unwrap();
+        let events = [l0, l1];
+        let metrics = replay(&manifest, events.iter(), Policy::Lru, &scope).unwrap();
+
+        let rendered = render_run(&args, &scope, Policy::Lru, DIGEST, OTHER_DIGEST, &metrics);
+        assert!(rendered.contains("cache_scope: per-layer\n"), "{rendered}");
+        assert!(
+            rendered.ends_with(
+                "peak_resident_bytes: 9\n\
+                 layer 0: quota_bytes: 10, peak_resident_bytes: 4\n\
+                 layer 1: quota_bytes: 5, peak_resident_bytes: 5\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn the_report_names_each_policy_from_the_domain_type() {
         for (policy, expected) in [
             (Policy::NoCache, "no-cache"),
@@ -532,10 +697,13 @@ mod tests {
                 trace: PathBuf::from("t.jsonl"),
                 model_manifest: PathBuf::from("m.json"),
                 global_budget_bytes: 10,
+                cache_scope: crate::cli::CacheScopeArg::Global,
+                layer_quota_bytes: vec![],
                 policy: crate::cli::PolicyArg::NoCache,
             };
             let rendered = render_run(
                 &args,
+                &CacheScope::Global { budget_bytes: 10 },
                 policy,
                 DIGEST,
                 OTHER_DIGEST,
@@ -561,6 +729,9 @@ mod tests {
 
     #[test]
     fn exit_codes_map_error_families_to_the_frozen_contract() {
+        let usage = CliError::Usage {
+            message: "--layer-quota-bytes requires --cache-scope per-layer".to_owned(),
+        };
         let read = CliError::Read {
             path: PathBuf::from("x"),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
@@ -587,6 +758,7 @@ mod tests {
             },
         };
 
+        assert_eq!(usage.exit_code(), 2);
         assert_eq!(read.exit_code(), 3);
         assert_eq!(trace_parse.exit_code(), 4);
         assert_eq!(manifest_parse.exit_code(), 4);

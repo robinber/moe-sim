@@ -11,14 +11,17 @@
 //! another member of the same set. The set also counts as a single access:
 //! recency and frequency never observe an order between members of one event.
 //!
-//! Resident bytes never exceed the supplied budget. When an atomic active set
-//! cannot fit even after evicting everything unpinned, replay fails instead of
-//! bypassing the cache or admitting the event in part.
+//! Resident bytes never exceed the applicable capacity: the total budget
+//! under a global scope, each layer's quota under a per-layer scope. When an
+//! atomic active set cannot fit even after evicting everything unpinned,
+//! replay fails instead of bypassing the cache or admitting the event in
+//! part.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::manifest::{ExpertKey, ManifestError, ModelManifest};
+use crate::scope::CacheScope;
 use crate::trace::Event;
 
 /// Cache policy applied during replay.
@@ -146,6 +149,59 @@ pub enum ReplayError {
         /// Capacity budget in bytes.
         budget_bytes: u64,
     },
+    /// An atomic active set does not fit its layer quota even with every
+    /// unpinned object of that layer evicted.
+    ///
+    /// The per-layer twin of [`ReplayError::ActiveSetExceedsCapacity`]:
+    /// callers are expected to run
+    /// [`ModelManifest::validate_per_layer_capacity`] first, and replay
+    /// repeats the check rather than trusting it.
+    #[error(
+        "active set does not fit its layer quota: event {event_index} request {request_id} layer {layer_id} needs {active_set_bytes} bytes, layer quota is {quota_bytes} bytes"
+    )]
+    ActiveSetExceedsLayerQuota {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Layer of the failing event.
+        layer_id: u32,
+        /// Total stored size of the atomic active set in bytes.
+        active_set_bytes: u64,
+        /// Quota of the event's layer in bytes.
+        quota_bytes: u64,
+    },
+    /// An event activates a layer that has no explicit quota.
+    ///
+    /// A per-layer cache requires an explicit quota for every simulated
+    /// layer; replay refuses to invent one.
+    #[error(
+        "missing layer quota: event {event_index} (request {request_id}) activates layer {layer_id}, which has no explicit quota"
+    )]
+    MissingLayerQuota {
+        /// Zero-based position of the failing event in the supplied order.
+        event_index: usize,
+        /// Request of the failing event.
+        request_id: u64,
+        /// Activated layer that has no quota.
+        layer_id: u32,
+    },
+    /// Summing the per-layer quotas would overflow `u64`.
+    #[error("layer quota sum overflowed u64")]
+    LayerQuotaSumOverflow,
+    /// The per-layer quotas together exceed the total budget.
+    ///
+    /// Checked before any event is replayed: a run under quotas that break
+    /// the `sum <= total budget` contract must not produce a report.
+    #[error(
+        "layer quotas exceed the total budget: quotas sum to {quota_sum_bytes} bytes, total budget is {total_budget_bytes} bytes"
+    )]
+    LayerQuotaSumExceedsTotalBudget {
+        /// Sum of every declared layer quota in bytes.
+        quota_sum_bytes: u64,
+        /// Total capacity budget in bytes.
+        total_budget_bytes: u64,
+    },
     /// A cumulative counter exceeded `u64`.
     ///
     /// Reported instead of wrapping silently: a wrapped metric is a wrong
@@ -164,7 +220,7 @@ pub enum ReplayError {
 /// Object and byte metrics are reported separately on purpose: an object-hit
 /// rate can hide expensive misses on larger experts, so neither number is
 /// derivable from the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplayMetrics {
     events: u64,
     object_loads: u64,
@@ -176,6 +232,7 @@ pub struct ReplayMetrics {
     evictions: u64,
     evicted_bytes: u64,
     peak_resident_bytes: u64,
+    layer_peak_resident_bytes: BTreeMap<u32, u64>,
 }
 
 impl ReplayMetrics {
@@ -250,24 +307,41 @@ impl ReplayMetrics {
         self.evicted_bytes
     }
 
-    /// Largest number of bytes resident at any instant during replay.
+    /// Largest number of bytes resident at any instant during replay, summed
+    /// over every cache in the selected scope.
     ///
-    /// Sampled while each atomic active set is pinned, which is when residency
-    /// is at its highest for that event.
+    /// Under [`CacheScope::Global`] this is the single cache's high-water
+    /// mark, sampled at each admission. Under [`CacheScope::PerLayer`] it is
+    /// the high-water mark of total residency across the layer caches; only
+    /// one layer's cache changes during an event, and residency within an
+    /// event peaks at its last admission, so per-event sampling is exact.
     #[must_use]
     pub fn peak_resident_bytes(&self) -> u64 {
         self.peak_resident_bytes
     }
+
+    /// Largest bytes resident in each per-layer cache, keyed by layer id.
+    ///
+    /// One entry per declared quota, including layers the trace never
+    /// activates (their peak is 0). Empty under [`CacheScope::Global`].
+    #[must_use]
+    pub fn layer_peak_resident_bytes(&self) -> &BTreeMap<u32, u64> {
+        &self.layer_peak_resident_bytes
+    }
 }
 
-/// Replays `events` against `manifest` under `policy` and one global budget.
+/// Replays `events` against `manifest` under `policy` within `scope`.
 ///
-/// Resident bytes never exceed `global_budget_bytes`. Each event's atomic
-/// active set is made fully resident before the event is accounted, and no
-/// member of that set can be evicted while it is pinned.
+/// Resident bytes never exceed the applicable capacity: the total budget
+/// under [`CacheScope::Global`], each layer's quota under
+/// [`CacheScope::PerLayer`]. Each event's atomic active set is made fully
+/// resident in its own layer's cache before the event is accounted, and no
+/// member of that set can be evicted while it is pinned. Unused quota is not
+/// shared between layers.
 ///
 /// [`Policy::NoCache`] retains nothing between events, so it never hits and
-/// never evicts; the budget still bounds each individual active set.
+/// never evicts; the applicable capacity still bounds each individual active
+/// set.
 ///
 /// `events` is iterated once and is never collected internally. The item bound
 /// is `&Event`, so every event must outlive the call and the caller therefore
@@ -276,36 +350,46 @@ impl ReplayMetrics {
 ///
 /// # Errors
 ///
+/// Returns [`ReplayError::LayerQuotaSumOverflow`] or
+/// [`ReplayError::LayerQuotaSumExceedsTotalBudget`] before any event is
+/// replayed when per-layer quotas break the `sum <= total budget` contract.
 /// Returns [`ReplayError::ActiveSetBytes`] when an event references an expert
 /// the manifest does not declare, or when one active set's byte total
 /// overflows.
-/// Returns [`ReplayError::ActiveSetExceedsCapacity`] when an atomic active set
-/// cannot fit the budget even with every unpinned object evicted.
+/// Returns [`ReplayError::MissingLayerQuota`] when an event activates a layer
+/// without an explicit quota.
+/// Returns [`ReplayError::ActiveSetExceedsCapacity`] under a global scope, or
+/// [`ReplayError::ActiveSetExceedsLayerQuota`] under a per-layer scope, when
+/// an atomic active set cannot fit even with every unpinned object evicted.
 /// Returns [`ReplayError::CounterOverflow`] when a cumulative counter exceeds
 /// `u64`.
 pub fn replay<'a>(
     manifest: &ModelManifest,
     events: impl IntoIterator<Item = &'a Event>,
     policy: Policy,
-    global_budget_bytes: u64,
+    scope: &CacheScope,
 ) -> Result<ReplayMetrics, ReplayError> {
     let mut metrics = ReplayMetrics::default();
-    let mut cache = ResidentCache::new(global_budget_bytes);
+    let mut caches = ScopedCaches::new(scope)?;
     let mut ever_loaded: BTreeSet<ExpertKey> = BTreeSet::new();
+    let mut peak_total_bytes: u64 = 0;
 
     for (event_index, event) in events.into_iter().enumerate() {
         let layer_id = event.layer_id();
+        let request_id = event.request_id();
         let active_set_bytes =
             manifest
                 .active_set_bytes(event)
                 .map_err(|source| ReplayError::ActiveSetBytes {
                     event_index,
-                    request_id: event.request_id(),
+                    request_id,
                     layer_id,
                     source,
                 })?;
 
         metrics.events = bump(metrics.events, 1, ReplayCounter::Events, event_index)?;
+
+        let cache = caches.cache_mut(layer_id, event_index, request_id)?;
 
         // The whole active set is pinned for this event, so nothing in it can
         // be chosen as an eviction victim while the set is being assembled.
@@ -320,7 +404,7 @@ pub fn replay<'a>(
                     .size_bytes(key)
                     .map_err(|source| ReplayError::ActiveSetBytes {
                         event_index,
-                        request_id: event.request_id(),
+                        request_id,
                         layer_id,
                         source,
                     })?;
@@ -346,41 +430,145 @@ pub fn replay<'a>(
         }
 
         if !evict_until_fits(
-            &mut cache,
+            cache,
             &mut metrics,
             policy,
             &pinned,
             required_bytes,
             event_index,
         )? {
-            return Err(ReplayError::ActiveSetExceedsCapacity {
-                event_index,
-                request_id: event.request_id(),
-                layer_id,
-                active_set_bytes,
-                budget_bytes: global_budget_bytes,
+            return Err(match scope {
+                CacheScope::Global { budget_bytes } => ReplayError::ActiveSetExceedsCapacity {
+                    event_index,
+                    request_id,
+                    layer_id,
+                    active_set_bytes,
+                    budget_bytes: *budget_bytes,
+                },
+                CacheScope::PerLayer { .. } => ReplayError::ActiveSetExceedsLayerQuota {
+                    event_index,
+                    request_id,
+                    layer_id,
+                    active_set_bytes,
+                    quota_bytes: cache.budget_bytes(),
+                },
             });
         }
 
-        admit_missing(
-            &mut cache,
-            &mut metrics,
-            &mut ever_loaded,
-            &missing,
-            event_index,
-        )?;
+        admit_missing(cache, &mut metrics, &mut ever_loaded, &missing, event_index)?;
 
         cache.record_access(&pinned);
 
+        // Sampled after this event's admissions and before any no-cache
+        // release: only this event's layer changed, and its residency peaks
+        // at the last admission, so the per-event sample is the true
+        // high-water of summed residency.
+        peak_total_bytes = peak_total_bytes.max(caches.total_resident_bytes());
+
         if policy == Policy::NoCache {
             // Release, not eviction: nothing was retained by choice.
-            cache.clear();
+            caches.cache_mut(layer_id, event_index, request_id)?.clear();
         }
     }
 
-    metrics.peak_resident_bytes = cache.peak_resident_bytes();
+    metrics.peak_resident_bytes = match &caches {
+        // The single cache samples its own high-water at each admission,
+        // which additionally exposes any transient excess inside one event.
+        ScopedCaches::Global(cache) => cache.peak_resident_bytes(),
+        ScopedCaches::PerLayer(_) => peak_total_bytes,
+    };
+    metrics.layer_peak_resident_bytes = caches.layer_peaks();
 
     Ok(metrics)
+}
+
+/// The resident caches for one replay: one per scope partition.
+enum ScopedCaches {
+    /// One cache over the total budget.
+    Global(ResidentCache),
+    /// One independent cache per quota'd layer.
+    PerLayer(BTreeMap<u32, ResidentCache>),
+}
+
+impl ScopedCaches {
+    /// Builds the caches, re-checking the quota-sum contract rather than
+    /// trusting the caller's validation pass.
+    fn new(scope: &CacheScope) -> Result<Self, ReplayError> {
+        match scope {
+            CacheScope::Global { budget_bytes } => {
+                Ok(Self::Global(ResidentCache::new(*budget_bytes)))
+            }
+            CacheScope::PerLayer {
+                total_budget_bytes,
+                layer_quota_bytes,
+            } => {
+                let mut quota_sum_bytes: u64 = 0;
+                for &quota in layer_quota_bytes.values() {
+                    quota_sum_bytes = quota_sum_bytes
+                        .checked_add(quota)
+                        .ok_or(ReplayError::LayerQuotaSumOverflow)?;
+                }
+                if quota_sum_bytes > *total_budget_bytes {
+                    return Err(ReplayError::LayerQuotaSumExceedsTotalBudget {
+                        quota_sum_bytes,
+                        total_budget_bytes: *total_budget_bytes,
+                    });
+                }
+                Ok(Self::PerLayer(
+                    layer_quota_bytes
+                        .iter()
+                        .map(|(&layer_id, &quota)| (layer_id, ResidentCache::new(quota)))
+                        .collect(),
+                ))
+            }
+        }
+    }
+
+    /// The cache an event on `layer_id` runs in.
+    fn cache_mut(
+        &mut self,
+        layer_id: u32,
+        event_index: usize,
+        request_id: u64,
+    ) -> Result<&mut ResidentCache, ReplayError> {
+        match self {
+            Self::Global(cache) => Ok(cache),
+            Self::PerLayer(caches) => {
+                caches
+                    .get_mut(&layer_id)
+                    .ok_or(ReplayError::MissingLayerQuota {
+                        event_index,
+                        request_id,
+                        layer_id,
+                    })
+            }
+        }
+    }
+
+    /// Bytes currently resident across every cache.
+    ///
+    /// Each cache stays within its budget and validation bounds the budget
+    /// sum, so the saturation can only mask an error that other invariants
+    /// already exclude.
+    fn total_resident_bytes(&self) -> u64 {
+        match self {
+            Self::Global(cache) => cache.resident_bytes(),
+            Self::PerLayer(caches) => caches.values().fold(0u64, |sum, cache| {
+                sum.saturating_add(cache.resident_bytes())
+            }),
+        }
+    }
+
+    /// Per-layer high-water marks; empty under a global scope.
+    fn layer_peaks(&self) -> BTreeMap<u32, u64> {
+        match self {
+            Self::Global(_) => BTreeMap::new(),
+            Self::PerLayer(caches) => caches
+                .iter()
+                .map(|(&layer_id, cache)| (layer_id, cache.peak_resident_bytes()))
+                .collect(),
+        }
+    }
 }
 
 /// Evicts unpinned objects until `required_bytes` fit, counting each eviction.
@@ -494,6 +682,14 @@ impl ResidentCache {
         self.entries.contains_key(&key)
     }
 
+    fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
     fn free_bytes(&self) -> u64 {
         self.budget_bytes.saturating_sub(self.resident_bytes)
     }
@@ -594,6 +790,21 @@ mod tests {
     use crate::manifest::ExpertSizeEntry;
     use crate::trace::{EventParts, Phase};
 
+    /// Global-scope shorthand: every pre-quota test replays under one budget.
+    fn replay_global<'a>(
+        manifest: &ModelManifest,
+        events: impl IntoIterator<Item = &'a Event>,
+        policy: Policy,
+        budget_bytes: u64,
+    ) -> Result<ReplayMetrics, ReplayError> {
+        replay(
+            manifest,
+            events,
+            policy,
+            &CacheScope::Global { budget_bytes },
+        )
+    }
+
     /// Builds a single-layer manifest from `(expert_id, size_bytes)` pairs.
     fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
         ModelManifest::try_from_entries(experts.iter().map(|&(expert_id, size_bytes)| {
@@ -634,7 +845,7 @@ mod tests {
         let manifest = two_experts_4_6();
         let events = [ev(vec![0, 1]), ev(vec![1])];
 
-        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         assert_eq!(metrics.events(), 2);
         assert_eq!(metrics.object_loads(), 3);
@@ -647,7 +858,7 @@ mod tests {
         let manifest = two_experts_4_6();
         let events = [ev(vec![0, 1]), ev(vec![0, 1])];
 
-        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         assert_eq!(metrics.object_hits(), 0);
         assert_eq!(metrics.byte_hits(), 0);
@@ -661,7 +872,7 @@ mod tests {
         let manifest = two_experts_4_6();
         let events = [ev(vec![0, 1]), ev(vec![0, 1])];
 
-        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         // Second activation of each expert is rework, not a cold miss.
         assert_eq!(metrics.object_reloads(), 2);
@@ -671,13 +882,13 @@ mod tests {
     #[test]
     fn empty_trace_yields_zeroed_metrics() {
         let no_events: [Event; 0] = [];
-        let metrics = replay(&two_experts_4_6(), &no_events, Policy::Lru, 10).unwrap();
+        let metrics = replay_global(&two_experts_4_6(), &no_events, Policy::Lru, 10).unwrap();
         assert_eq!(metrics, ReplayMetrics::default());
     }
 
     #[test]
     fn empty_active_set_is_an_event_that_loads_nothing() {
-        let metrics = replay(&two_experts_4_6(), &[ev(vec![])], Policy::Lru, 10).unwrap();
+        let metrics = replay_global(&two_experts_4_6(), &[ev(vec![])], Policy::Lru, 10).unwrap();
 
         assert_eq!(metrics.events(), 1);
         assert_eq!(metrics.object_loads(), 0);
@@ -692,7 +903,7 @@ mod tests {
         let events = [ev(vec![0, 1]), ev(vec![0, 1])];
 
         for policy in [Policy::Lru, Policy::Lfu] {
-            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            let metrics = replay_global(&manifest, &events, policy, 10).unwrap();
 
             assert_eq!(metrics.object_loads(), 2, "{policy}");
             assert_eq!(metrics.byte_loads(), 10, "{policy}");
@@ -732,7 +943,7 @@ mod tests {
         };
         let events = [on_layer(0), on_layer(1)];
 
-        let metrics = replay(&manifest, &events, Policy::Lru, 5).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lru, 5).unwrap();
 
         assert_eq!(metrics.object_loads(), 2, "layer 1 expert 0 is cold");
         assert_eq!(metrics.object_hits(), 0);
@@ -764,7 +975,7 @@ mod tests {
     fn lfu_keeps_the_frequently_used_object() {
         let (manifest, events) = frequency_versus_recency_trace();
 
-        let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lfu, 10).unwrap();
 
         assert_eq!(metrics.events(), 6);
         assert_eq!(metrics.object_loads(), 3);
@@ -784,7 +995,7 @@ mod tests {
     fn lru_drops_the_frequently_used_object_when_it_ages() {
         let (manifest, events) = frequency_versus_recency_trace();
 
-        let metrics = replay(&manifest, &events, Policy::Lru, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lru, 10).unwrap();
 
         assert_eq!(metrics.events(), 6);
         assert_eq!(metrics.object_loads(), 4);
@@ -814,7 +1025,7 @@ mod tests {
             ev(vec![0]),
         ];
 
-        let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lfu, 10).unwrap();
 
         assert_eq!(
             metrics.object_loads(),
@@ -858,7 +1069,7 @@ mod tests {
             ev(vec![0]),
         ];
 
-        let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lfu, 10).unwrap();
 
         assert_eq!(metrics.events(), 8);
         assert_eq!(
@@ -889,7 +1100,7 @@ mod tests {
         let events = [ev(vec![0, 1]), ev(vec![0, 2]), ev(vec![0])];
 
         for policy in [Policy::Lru, Policy::Lfu] {
-            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            let metrics = replay_global(&manifest, &events, policy, 10).unwrap();
 
             assert_eq!(
                 metrics.object_reloads(),
@@ -909,7 +1120,7 @@ mod tests {
         let events = [ev(vec![0, 1]), ev(vec![2, 3]), ev(vec![0, 1])];
 
         for policy in [Policy::Lru, Policy::Lfu] {
-            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            let metrics = replay_global(&manifest, &events, policy, 10).unwrap();
 
             assert_eq!(metrics.object_loads(), 6, "{policy}");
             assert_eq!(metrics.evictions(), 4, "{policy}");
@@ -929,14 +1140,14 @@ mod tests {
         let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
 
         for policy in [Policy::Lru, Policy::Lfu] {
-            let survivor = replay(
+            let survivor = replay_global(
                 &manifest,
                 &[ev(vec![0, 1]), ev(vec![2]), ev(vec![1])],
                 policy,
                 10,
             )
             .unwrap();
-            let victim = replay(
+            let victim = replay_global(
                 &manifest,
                 &[ev(vec![0, 1]), ev(vec![2]), ev(vec![0])],
                 policy,
@@ -960,8 +1171,8 @@ mod tests {
         let descending = [ev(vec![1, 0]), ev(vec![2]), ev(vec![1])];
 
         for policy in [Policy::Lru, Policy::Lfu] {
-            let from_ascending = replay(&manifest, &ascending, policy, 10).unwrap();
-            let from_descending = replay(&manifest, &descending, policy, 10).unwrap();
+            let from_ascending = replay_global(&manifest, &ascending, policy, 10).unwrap();
+            let from_descending = replay_global(&manifest, &descending, policy, 10).unwrap();
             assert_eq!(from_ascending, from_descending, "{policy}");
         }
     }
@@ -972,7 +1183,7 @@ mod tests {
         let events = [ev(vec![0, 1])];
 
         for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
-            let err = replay(&manifest, &events, policy, 10).unwrap_err();
+            let err = replay_global(&manifest, &events, policy, 10).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -1014,7 +1225,7 @@ mod tests {
 
         for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
             for budget in [8u64, 9, 12, 19, 100] {
-                let metrics = replay(&manifest, &events, policy, budget).unwrap();
+                let metrics = replay_global(&manifest, &events, policy, budget).unwrap();
                 assert!(
                     metrics.peak_resident_bytes() <= budget,
                     "{policy} at budget {budget}: peak {} exceeded it",
@@ -1032,7 +1243,7 @@ mod tests {
         let manifest = manifest_of(&[(0, 3), (1, 7), (2, 3)]);
         let events = [ev(vec![0, 1]), ev(vec![1]), ev(vec![2])];
 
-        let metrics = replay(&manifest, &events, Policy::Lru, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lru, 10).unwrap();
 
         assert_eq!(metrics.evictions(), 1);
         assert_eq!(metrics.evicted_bytes(), 3);
@@ -1044,7 +1255,7 @@ mod tests {
         let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
         let events: Vec<Event> = (0..9).map(|i| ev(vec![i % 3])).collect();
 
-        let metrics = replay(&manifest, &events, Policy::Lru, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::Lru, 10).unwrap();
 
         assert_eq!(metrics.object_hits(), 0, "every access misses");
         assert_eq!(metrics.object_loads(), 9);
@@ -1060,7 +1271,7 @@ mod tests {
         let events: Vec<Event> = (0..12).map(|i| ev(vec![i % 3])).collect();
 
         for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
-            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            let metrics = replay_global(&manifest, &events, policy, 10).unwrap();
             let cold = metrics.object_loads() - metrics.object_reloads();
             assert_eq!(cold, 3, "{policy}: one cold miss per distinct expert");
         }
@@ -1073,7 +1284,7 @@ mod tests {
         let activations = 12;
 
         for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
-            let metrics = replay(&manifest, &events, policy, 10).unwrap();
+            let metrics = replay_global(&manifest, &events, policy, 10).unwrap();
             assert_eq!(
                 metrics.object_hits() + metrics.object_loads(),
                 activations,
@@ -1111,7 +1322,7 @@ mod tests {
 
         for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
             for budget in [11u64, 20] {
-                let metrics = replay(&manifest, &events, policy, budget).unwrap();
+                let metrics = replay_global(&manifest, &events, policy, budget).unwrap();
                 assert_eq!(
                     metrics.object_hits() + metrics.object_loads(),
                     activations,
@@ -1137,8 +1348,8 @@ mod tests {
         let events: Vec<Event> = (0..20).map(|i| ev(vec![i % 3])).collect();
 
         for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
-            let first = replay(&manifest, &events, policy, 10).unwrap();
-            let second = replay(&manifest, &events, policy, 10).unwrap();
+            let first = replay_global(&manifest, &events, policy, 10).unwrap();
+            let second = replay_global(&manifest, &events, policy, 10).unwrap();
             assert_eq!(first, second, "{policy}");
         }
     }
@@ -1159,7 +1370,7 @@ mod tests {
         };
         let events = [descending(9, vec![0, 1]), descending(0, vec![1])];
 
-        let metrics = replay(&manifest, &events, Policy::NoCache, 10).unwrap();
+        let metrics = replay_global(&manifest, &events, Policy::NoCache, 10).unwrap();
 
         assert_eq!(metrics.byte_loads(), 16);
     }
@@ -1171,7 +1382,7 @@ mod tests {
         let manifest = two_experts_4_6();
         let events = [ev(vec![0]), ev(vec![7])];
 
-        let err = replay(&manifest, &events, Policy::Lru, 10).unwrap_err();
+        let err = replay_global(&manifest, &events, Policy::Lru, 10).unwrap_err();
 
         assert!(
             matches!(
@@ -1192,7 +1403,7 @@ mod tests {
         let manifest = manifest_of(&[(0, u64::MAX), (1, 1)]);
         let events = [ev(vec![0]), ev(vec![1])];
 
-        let err = replay(&manifest, &events, Policy::NoCache, u64::MAX).unwrap_err();
+        let err = replay_global(&manifest, &events, Policy::NoCache, u64::MAX).unwrap_err();
 
         assert!(
             matches!(
@@ -1213,7 +1424,7 @@ mod tests {
         let manifest = manifest_of(&[(0, u64::MAX)]);
         let events = [ev(vec![0]), ev(vec![0]), ev(vec![0])];
 
-        let err = replay(&manifest, &events, Policy::Lru, u64::MAX).unwrap_err();
+        let err = replay_global(&manifest, &events, Policy::Lru, u64::MAX).unwrap_err();
 
         assert!(
             matches!(
@@ -1232,8 +1443,299 @@ mod tests {
         let manifest = two_experts_4_6();
         let events = [ev(vec![0, 1]), ev(vec![1])];
 
-        let streamed = replay(&manifest, events.iter(), Policy::NoCache, 10).unwrap();
+        let streamed = replay_global(&manifest, events.iter(), Policy::NoCache, 10).unwrap();
 
         assert_eq!(streamed.byte_loads(), 16);
+    }
+
+    // --- per-layer quotas ---
+
+    /// Builds a manifest from `(layer_id, expert_id, size_bytes)` triples.
+    fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
+        ModelManifest::try_from_entries(experts.iter().map(|&(layer_id, expert_id, size_bytes)| {
+            ExpertSizeEntry {
+                key: ExpertKey::new(layer_id, expert_id),
+                size_bytes,
+            }
+        }))
+        .unwrap()
+    }
+
+    /// One event on `layer_id` activating `expert_ids` as an atomic set.
+    fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
+        Event::new(EventParts {
+            request_id: 1,
+            phase: Phase::Decode,
+            step_id: 0,
+            token_position: 0,
+            layer_id,
+            expert_ids,
+        })
+        .unwrap()
+    }
+
+    fn per_layer(total_budget_bytes: u64, quotas: &[(u32, u64)]) -> CacheScope {
+        CacheScope::PerLayer {
+            total_budget_bytes,
+            layer_quota_bytes: quotas.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn unused_quota_is_not_shared_between_layers() {
+        // Layer 0 is at its quota while layer 1 has 5 free bytes. The third
+        // layer-0 set must evict inside layer 0 anyway, and the final event
+        // pays a reload for it. A cache that pooled the two quotas would fit
+        // everything: 4 loads, 1 hit, 0 evictions.
+        let manifest = manifest_layers(&[(0, 0, 5), (0, 1, 5), (0, 2, 5), (1, 0, 5)]);
+        let events = [
+            ev_on(0, vec![0, 1]),
+            ev_on(1, vec![0]),
+            ev_on(0, vec![2]),
+            ev_on(0, vec![0]),
+        ];
+        let scope = per_layer(20, &[(0, 10), (1, 10)]);
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, &scope).unwrap();
+
+            assert_eq!(metrics.object_loads(), 5, "{policy}: no pooled fit");
+            assert_eq!(metrics.object_hits(), 0, "{policy}");
+            assert_eq!(metrics.object_reloads(), 1, "{policy}");
+            assert_eq!(metrics.evictions(), 2, "{policy}");
+        }
+    }
+
+    #[test]
+    fn per_layer_peaks_respect_each_quota_on_adversarial_traces() {
+        // Variable sizes, shifting hot sets, and interleaved layers: every
+        // layer cache must stay inside its own quota, and total residency
+        // inside the total budget, for every policy at every feasible quota
+        // pair.
+        let manifest = manifest_layers(&[
+            (0, 0, 1),
+            (0, 1, 2),
+            (0, 2, 3),
+            (0, 3, 5),
+            (0, 4, 8),
+            (1, 0, 2),
+            (1, 1, 4),
+            (1, 2, 6),
+        ]);
+        let events = [
+            ev_on(0, vec![0, 1]),
+            ev_on(1, vec![0, 1]),
+            ev_on(0, vec![4]),
+            ev_on(1, vec![2]),
+            ev_on(0, vec![2, 3]),
+            ev_on(0, vec![0]),
+            ev_on(1, vec![1]),
+            ev_on(0, vec![4]),
+            ev_on(1, vec![0, 1]),
+            ev_on(0, vec![2]),
+        ];
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            for (quota_0, quota_1) in [(8u64, 6u64), (9, 7), (12, 10), (100, 100)] {
+                let total = quota_0 + quota_1;
+                let scope = per_layer(total, &[(0, quota_0), (1, quota_1)]);
+                let metrics = replay(&manifest, &events, policy, &scope).unwrap();
+
+                let peaks = metrics.layer_peak_resident_bytes();
+                assert!(
+                    peaks[&0] <= quota_0,
+                    "{policy} at quotas ({quota_0}, {quota_1}): layer 0 peak {} exceeded its quota",
+                    peaks[&0]
+                );
+                assert!(
+                    peaks[&1] <= quota_1,
+                    "{policy} at quotas ({quota_0}, {quota_1}): layer 1 peak {} exceeded its quota",
+                    peaks[&1]
+                );
+                assert!(
+                    metrics.peak_resident_bytes() <= total,
+                    "{policy} at quotas ({quota_0}, {quota_1}): total peak {} exceeded the budget",
+                    metrics.peak_resident_bytes()
+                );
+                assert!(
+                    metrics.peak_resident_bytes() <= peaks[&0] + peaks[&1],
+                    "{policy}: summed residency can never top the summed peaks"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_member_survives_per_layer_pressure_with_interleaved_layers() {
+        // Within layer 0 this is the classic pinning adversary: the resident
+        // member of the active set is also the policy's natural victim. The
+        // interleaved layer-1 events must not disturb layer 0's recency or
+        // pinning in either direction.
+        let manifest = manifest_layers(&[(0, 0, 5), (0, 1, 5), (0, 2, 5), (1, 0, 5)]);
+        let events = [
+            ev_on(0, vec![0, 1]),
+            ev_on(1, vec![0]),
+            ev_on(0, vec![0, 2]),
+            ev_on(1, vec![0]),
+            ev_on(0, vec![0]),
+        ];
+        let scope = per_layer(15, &[(0, 10), (1, 5)]);
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, &scope).unwrap();
+
+            assert_eq!(
+                metrics.object_reloads(),
+                0,
+                "{policy} evicted a pinned member of the active set"
+            );
+            assert_eq!(metrics.object_hits(), 3, "{policy}");
+            assert_eq!(metrics.object_loads(), 4, "{policy}");
+            assert_eq!(metrics.evictions(), 1, "{policy}");
+        }
+    }
+
+    #[test]
+    fn an_active_set_exceeding_its_layer_quota_is_rejected_within_the_total_budget() {
+        // The total budget would hold the set easily; its layer quota does
+        // not, and unused budget must not absorb the excess.
+        let manifest = manifest_layers(&[(0, 0, 6), (0, 1, 6)]);
+        let events = [ev_on(0, vec![0, 1])];
+        let scope = per_layer(100, &[(0, 10)]);
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let err = replay(&manifest, &events, policy, &scope).unwrap_err();
+            assert_eq!(
+                err,
+                ReplayError::ActiveSetExceedsLayerQuota {
+                    event_index: 0,
+                    request_id: 1,
+                    layer_id: 0,
+                    active_set_bytes: 12,
+                    quota_bytes: 10,
+                },
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_on_a_layer_without_a_quota_is_rejected() {
+        let manifest = manifest_layers(&[(0, 0, 5), (1, 0, 5)]);
+        let events = [ev_on(0, vec![0]), ev_on(1, vec![0])];
+        let scope = per_layer(10, &[(0, 10)]);
+
+        let err = replay(&manifest, &events, Policy::Lru, &scope).unwrap_err();
+        assert_eq!(
+            err,
+            ReplayError::MissingLayerQuota {
+                event_index: 1,
+                request_id: 1,
+                layer_id: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn quotas_breaking_the_total_budget_are_rejected_before_any_event() {
+        let manifest = manifest_layers(&[(0, 0, 5), (1, 0, 5)]);
+        let events = [ev_on(0, vec![0])];
+
+        let err = replay(
+            &manifest,
+            &events,
+            Policy::Lru,
+            &per_layer(17, &[(0, 10), (1, 8)]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ReplayError::LayerQuotaSumExceedsTotalBudget {
+                quota_sum_bytes: 18,
+                total_budget_bytes: 17,
+            }
+        );
+
+        let err = replay(
+            &manifest,
+            &events,
+            Policy::Lru,
+            &per_layer(u64::MAX, &[(0, u64::MAX), (1, 1)]),
+        )
+        .unwrap_err();
+        assert_eq!(err, ReplayError::LayerQuotaSumOverflow);
+    }
+
+    #[test]
+    fn aggregate_peak_is_the_high_water_of_summed_residency_not_the_sum_of_peaks() {
+        // Under no-cache the two layers are never resident at the same
+        // instant, so the aggregate peak is layer 0's 10 bytes while the
+        // per-layer peaks sum to 18. An implementation that added the peaks
+        // would overstate residency.
+        let manifest = manifest_layers(&[(0, 0, 4), (0, 1, 6), (1, 0, 5), (1, 1, 3)]);
+        let events = [ev_on(0, vec![0, 1]), ev_on(1, vec![0, 1])];
+        let scope = per_layer(18, &[(0, 10), (1, 8)]);
+
+        let metrics = replay(&manifest, &events, Policy::NoCache, &scope).unwrap();
+
+        assert_eq!(metrics.peak_resident_bytes(), 10);
+        assert_eq!(metrics.layer_peak_resident_bytes()[&0], 10);
+        assert_eq!(metrics.layer_peak_resident_bytes()[&1], 8);
+        assert_eq!(metrics.evictions(), 0, "a release is not an eviction");
+    }
+
+    #[test]
+    fn per_layer_with_one_layer_matches_the_global_metrics() {
+        // A single quota covering the whole budget is the same simulation as
+        // a global cache of that size; only the layer breakdown differs.
+        let (manifest, events) = frequency_versus_recency_trace();
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let global = replay_global(&manifest, &events, policy, 10).unwrap();
+            let scoped = replay(&manifest, &events, policy, &per_layer(10, &[(0, 10)])).unwrap();
+
+            assert_eq!(scoped.object_loads(), global.object_loads(), "{policy}");
+            assert_eq!(scoped.byte_loads(), global.byte_loads(), "{policy}");
+            assert_eq!(scoped.object_hits(), global.object_hits(), "{policy}");
+            assert_eq!(scoped.byte_hits(), global.byte_hits(), "{policy}");
+            assert_eq!(scoped.object_reloads(), global.object_reloads(), "{policy}");
+            assert_eq!(scoped.evictions(), global.evictions(), "{policy}");
+            assert_eq!(
+                scoped.peak_resident_bytes(),
+                global.peak_resident_bytes(),
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_layer_replay_is_deterministic() {
+        let manifest = manifest_layers(&[(0, 0, 3), (0, 1, 5), (1, 0, 4), (1, 1, 2)]);
+        let events: Vec<Event> = (0..20)
+            .map(|i| ev_on(u32::from(i % 2 == 1), vec![i % 2]))
+            .collect();
+        let scope = per_layer(14, &[(0, 8), (1, 6)]);
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            let first = replay(&manifest, &events, policy, &scope).unwrap();
+            let second = replay(&manifest, &events, policy, &scope).unwrap();
+            assert_eq!(first, second, "{policy}");
+        }
+    }
+
+    #[test]
+    fn unactivated_quota_layers_report_a_zero_peak() {
+        // The quota is part of the configuration, so the report shows the
+        // layer even when the trace never touches it.
+        let manifest = manifest_layers(&[(0, 0, 5), (1, 0, 5)]);
+        let events = [ev_on(0, vec![0])];
+        let scope = per_layer(15, &[(0, 10), (1, 5)]);
+
+        let metrics = replay(&manifest, &events, Policy::Lru, &scope).unwrap();
+
+        assert_eq!(
+            metrics.layer_peak_resident_bytes(),
+            &[(0u32, 5u64), (1u32, 0u64)].into_iter().collect()
+        );
     }
 }

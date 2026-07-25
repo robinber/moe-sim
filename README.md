@@ -19,8 +19,7 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 **Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
 (atomic-set validation), an explicit expert-size `ModelManifest`, and
 deterministic replay with byte-accurate accounting under no-cache, LRU, and
-LFU within one global budget. Per-layer cache scopes are not implemented yet.
-The
+LFU — within one global budget or under explicit fixed per-layer quotas. The
 intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
 byte budgets. Everything beyond that is optional curiosity, not a tunnel to
 finish.
@@ -146,6 +145,12 @@ typed errors on stderr with a meaningful exit code: `0` success, `2` bad
 arguments, `3` read failure, `4` parse failure, `5` capacity rejection, `6`
 replay failure. Failures never emit partial stdout.
 
+`capacity check` and `run` take `--cache-scope global|per-layer` (default
+`global`). A per-layer scope additionally requires one repeated
+`--layer-quota-bytes LAYER:BYTES` flag per simulated layer; quotas under a
+global scope, a per-layer scope without quotas, or one layer quoted twice are
+argument errors (exit code 2). Every report records the selected scope.
+
 Every success report opens with provenance — the tool version, the input
 contract version, and a SHA-256 digest of each input beside its path. The
 digests are reproducible with `shasum -a 256 <path>`.
@@ -190,6 +195,7 @@ trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
 model_manifest: fixtures/models/two-experts-4-6.json
 model_manifest_sha256: 543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538
 global_budget_bytes: 10
+cache_scope: global
 events: 2
 manifest_experts: 2
 ```
@@ -229,6 +235,7 @@ trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
 model_manifest: fixtures/models/two-experts-4-6.json
 model_manifest_sha256: 543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538
 global_budget_bytes: 10
+cache_scope: global
 policy: no-cache
 events: 2
 object_loads: 3
@@ -263,6 +270,7 @@ trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
 model_manifest: fixtures/models/two-experts-4-6.json
 model_manifest_sha256: 543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538
 global_budget_bytes: 10
+cache_scope: global
 policy: lru
 events: 2
 object_loads: 2
@@ -276,10 +284,59 @@ evicted_bytes: 0
 peak_resident_bytes: 10
 ```
 
-Capacity is validated before replay, so an infeasible budget is rejected with
-exit code 5 and no metrics are emitted. Resident bytes never exceed the budget
-under any policy, and no member of the active set can be evicted while its
-event is in flight.
+`--cache-scope per-layer` runs the same policies inside one independent cache
+per layer. Every simulated layer needs an explicit quota, the quotas may not
+sum past the total budget, and unused quota is not shared: an eviction in one
+layer never frees room in another. The committed two-layer fixture makes the
+partition visible — layer 1 evicts inside its own 5-byte quota, and the report
+pairs each quota with that cache's peak so the per-layer capacity invariant
+can be audited from the output alone:
+
+```bash
+moe-sim run \
+  --trace fixtures/synthetic/two-layers.jsonl \
+  --model-manifest fixtures/models/two-layers.json \
+  --global-budget-bytes 15 \
+  --cache-scope per-layer \
+  --layer-quota-bytes 0:10 \
+  --layer-quota-bytes 1:5 \
+  --policy lru
+```
+
+```text
+status: ok
+tool_version: 0.1.0
+input_format: v1
+trace: fixtures/synthetic/two-layers.jsonl
+trace_sha256: 35c61891c72dba7d6eeac758215f320afbef900e106646face1c58a3b268f824
+model_manifest: fixtures/models/two-layers.json
+model_manifest_sha256: 1c94b98f26c0f18f85a5aaca95b1a2d70ea8a1befeb55d8d8a893e792c0d7596
+global_budget_bytes: 15
+cache_scope: per-layer
+policy: lru
+events: 4
+object_loads: 4
+byte_loads: 18
+object_hits: 1
+byte_hits: 6
+object_reloads: 0
+byte_reloads: 0
+evictions: 1
+evicted_bytes: 5
+peak_resident_bytes: 15
+layer 0: quota_bytes: 10, peak_resident_bytes: 10
+layer 1: quota_bytes: 5, peak_resident_bytes: 5
+```
+
+The aggregate `peak_resident_bytes` is the high-water mark of summed residency
+across the layer caches, not the sum of the per-layer peaks: caches that fill
+at different times never overstate simultaneous residency.
+
+Capacity is validated before replay, so an infeasible configuration is
+rejected with exit code 5 and no metrics are emitted. Resident bytes never
+exceed the applicable capacity — the budget under a global scope, each layer's
+quota under a per-layer scope — and no member of the active set can be evicted
+while its event is in flight.
 
 Two metric definitions are worth stating plainly, because comparisons depend
 on them:
