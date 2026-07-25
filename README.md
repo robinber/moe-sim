@@ -17,7 +17,9 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 ## Status
 
 **Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
-(atomic-set validation) and an explicit expert-size `ModelManifest`. The
+(atomic-set validation), an explicit expert-size `ModelManifest`, and
+deterministic replay with byte-accurate accounting under the no-cache
+baseline. Caching policies are not implemented yet. The
 intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
 byte budgets. Everything beyond that is optional curiosity, not a tunnel to
 finish.
@@ -136,12 +138,16 @@ Every report records its inputs and their versions or checksums.
 
 ## CLI
 
-Two commands are implemented today: `trace inspect` and `capacity check`.
-Both are flag-driven (no positional arguments), take budgets as plain byte
-counts, print a deterministic report to stdout on success, and report typed
-errors on stderr with a meaningful exit code: `0` success, `2` bad arguments,
-`3` read failure, `4` parse failure, `5` capacity rejection. Failures never
-emit partial stdout.
+Three commands are implemented today: `trace inspect`, `capacity check`, and
+`run`. All are flag-driven (no positional arguments), take budgets as plain
+byte counts, print a deterministic report to stdout on success, and report
+typed errors on stderr with a meaningful exit code: `0` success, `2` bad
+arguments, `3` read failure, `4` parse failure, `5` capacity rejection, `6`
+replay failure. Failures never emit partial stdout.
+
+Every success report opens with provenance — the tool version, the input
+contract version, and a SHA-256 digest of each input beside its path. The
+digests are reproducible with `shasum -a 256 <path>`.
 
 Inspect a committed trace fixture:
 
@@ -201,18 +207,51 @@ moe-sim capacity check \
 error: capacity check failed: active set exceeds global capacity: event 0 request 1 layer 0 totals 10 bytes, global budget is 9 bytes
 ```
 
-### Planned commands
-
-`run` and `compare` belong to Milestone 1 and are not available yet:
+Replay the trace under the no-cache baseline. Nothing is retained between
+events, so every activation is a load and residency peaks at the largest
+atomic active set:
 
 ```bash
 moe-sim run \
   --trace fixtures/synthetic/active-set-0-1.jsonl \
   --model-manifest fixtures/models/two-experts-4-6.json \
-  --memory-budget-bytes 10 \
-  --cache-scope global \
-  --policy lru
+  --global-budget-bytes 10 \
+  --policy no-cache
+```
 
+```text
+status: ok
+tool_version: 0.1.0
+input_format: v1
+trace: fixtures/synthetic/active-set-0-1.jsonl
+trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
+model_manifest: fixtures/models/two-experts-4-6.json
+model_manifest_sha256: 543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538
+global_budget_bytes: 10
+policy: no-cache
+events: 2
+object_loads: 3
+byte_loads: 16
+object_hits: 0
+byte_hits: 0
+evictions: 0
+peak_resident_bytes: 10
+```
+
+Capacity is validated before replay, so an infeasible budget is rejected with
+exit code 5 and no metrics are emitted.
+
+Releasing a pinned active set after its event is **not** an eviction: eviction
+is the capacity-driven removal of an object a policy chose to retain. A policy
+that retains nothing therefore evicts nothing, which keeps this baseline
+comparable with the caching policies measured against it.
+
+### Planned commands
+
+`compare` belongs to Milestone 1 and is not available yet. Additional `run`
+policies (LRU, LFU, offline references) arrive with slices 1B and 1C:
+
+```bash
 moe-sim compare \
   --trace fixtures/synthetic/active-set-0-1.jsonl \
   --model-manifest fixtures/models/two-experts-4-6.json \

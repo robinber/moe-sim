@@ -130,11 +130,13 @@ pass — optional if you are not publishing.
 
 ### Slice 1A — Replay and accounting
 
-- [ ] Sequential file-order event replay.
-- [ ] Atomic pin / use / release behavior.
-- [ ] Byte-accurate residency and eviction accounting.
-- [ ] No-cache baseline.
-- [ ] `trace inspect` and a text-only `run` command.
+- [x] Sequential file-order event replay.
+- [x] Atomic pin / use / release behavior.
+- [x] Byte-accurate residency and eviction accounting. A release after use is
+  not an eviction: eviction is capacity-driven removal of a retained object, so
+  the no-cache baseline evicts nothing and stays comparable with 1B.
+- [x] No-cache baseline.
+- [x] `trace inspect` and a text-only `run` command.
 
 **Gate:** hand-calculated no-cache and residency fixtures match exactly.
 
