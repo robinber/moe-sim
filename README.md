@@ -330,7 +330,10 @@ layer 1: quota_bytes: 5, peak_resident_bytes: 5
 
 The aggregate `peak_resident_bytes` is the high-water mark of summed residency
 across the layer caches, not the sum of the per-layer peaks: caches that fill
-at different times never overstate simultaneous residency.
+at different times never overstate simultaneous residency. On this example the
+two coincide because both caches are full at once; replaying the same fixture
+under `--policy no-cache` separates them — the aggregate peak drops to 10
+while the layer peaks still read 10 and 5.
 
 Capacity is validated before replay, so an infeasible configuration is
 rejected with exit code 5 and no metrics are emitted. Resident bytes never

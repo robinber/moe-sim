@@ -121,8 +121,11 @@ pub enum CapacityError {
         /// Global capacity budget in bytes.
         global_budget_bytes: u64,
     },
-    /// A per-layer quota references a layer absent from the manifest.
-    #[error("layer quota references unknown layer: layer {layer_id} declares no experts")]
+    /// A per-layer quota references a layer that declares no manifest experts
+    /// and is never activated by the trace.
+    #[error(
+        "layer quota references unknown layer: layer {layer_id} declares no experts and is never activated"
+    )]
     QuotaForUnknownLayer {
         /// Layer named by the quota.
         layer_id: u32,
@@ -400,14 +403,17 @@ impl ModelManifest {
     ///
     /// A per-layer cache requires an explicit quota for every simulated
     /// layer; the quotas must sum to no more than `total_budget_bytes`, and
-    /// unused quota is not shared. A quota may name any manifest layer, even
-    /// one the trace never activates; a manifest layer that is neither
-    /// activated nor named by a quota is not simulated and stays unchecked.
+    /// unused quota is not shared. A quota must name a layer that either
+    /// declares experts in this manifest or is activated by `events` — an
+    /// expert-less layer can still be simulated through empty active sets. A
+    /// manifest layer that is neither activated nor named by a quota is not
+    /// simulated and stays unchecked.
     ///
     /// # Errors
     ///
     /// Returns [`CapacityError::QuotaForUnknownLayer`] when a quota names a
-    /// layer that declares no experts in this manifest.
+    /// layer that declares no experts in this manifest and is never
+    /// activated.
     /// Returns [`CapacityError::LayerQuotaSumOverflow`] when the quota sum
     /// overflows `u64`, and
     /// [`CapacityError::LayerQuotaSumExceedsTotalBudget`] when the sum
@@ -425,13 +431,6 @@ impl ModelManifest {
         layer_quota_bytes: &BTreeMap<u32, u64>,
         events: impl IntoIterator<Item = &'a Event>,
     ) -> Result<(), CapacityError> {
-        let manifest_layers: BTreeSet<u32> = self.sizes.keys().map(|key| key.layer_id()).collect();
-        for &layer_id in layer_quota_bytes.keys() {
-            if !manifest_layers.contains(&layer_id) {
-                return Err(CapacityError::QuotaForUnknownLayer { layer_id });
-            }
-        }
-
         let mut quota_sum_bytes: u64 = 0;
         for &quota in layer_quota_bytes.values() {
             quota_sum_bytes = quota_sum_bytes
@@ -458,8 +457,10 @@ impl ModelManifest {
             }
         }
 
+        let mut activated_layers: BTreeSet<u32> = BTreeSet::new();
         for (event_index, event) in events.into_iter().enumerate() {
             let layer_id = event.layer_id();
+            activated_layers.insert(layer_id);
             let Some(&quota_bytes) = layer_quota_bytes.get(&layer_id) else {
                 return Err(CapacityError::MissingLayerQuota {
                     event_index,
@@ -483,6 +484,13 @@ impl ModelManifest {
                     active_set_bytes,
                     quota_bytes,
                 });
+            }
+        }
+
+        let manifest_layers: BTreeSet<u32> = self.sizes.keys().map(|key| key.layer_id()).collect();
+        for &layer_id in layer_quota_bytes.keys() {
+            if !manifest_layers.contains(&layer_id) && !activated_layers.contains(&layer_id) {
+                return Err(CapacityError::QuotaForUnknownLayer { layer_id });
             }
         }
 
@@ -1070,6 +1078,33 @@ mod tests {
         let events = [sample_event(0, vec![0])];
         assert_eq!(
             manifest.validate_per_layer_capacity(18, &quotas(&[(0, 10), (1, 8)]), &events),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_accepts_an_empty_active_set_on_an_expertless_layer() {
+        // A layer can be simulated through empty active sets without
+        // declaring any expert. Its quota is legitimate configuration, and
+        // rejecting it would refuse a trace replay accepts.
+        let manifest = ModelManifest::try_from_entries([]).unwrap();
+        let events = [sample_event(7, vec![])];
+        assert_eq!(
+            manifest.validate_per_layer_capacity(0, &quotas(&[(7, 0)]), &events),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn per_layer_capacity_accepts_an_empty_quota_map_with_an_empty_trace() {
+        // Nothing is simulated, so nothing needs a quota; the surface rule
+        // that a per-layer run must name at least one quota belongs to the
+        // CLI, not to this validator.
+        let manifest = ModelManifest::try_from_entries([entry(0, 0, 1)]).unwrap();
+        let no_events: [Event; 0] = [];
+        let empty = BTreeMap::new();
+        assert_eq!(
+            manifest.validate_per_layer_capacity(0, &empty, &no_events),
             Ok(())
         );
     }

@@ -194,7 +194,8 @@ pub struct TraceInspectArgs {
 /// `moe-sim capacity` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CapacityCommand {
-    /// Validate a trace and manifest against a global byte budget.
+    /// Validate a trace and manifest against the selected cache scope's byte
+    /// capacity.
     Check(CapacityCheckArgs),
 }
 

@@ -72,7 +72,8 @@ pub enum CliError {
         /// Underlying wire or domain parse error.
         source: ManifestParseError,
     },
-    /// The `(trace, manifest, budget)` triple failed capacity validation.
+    /// The trace, manifest, and budget configuration — global budget, or
+    /// total budget plus layer quotas — failed capacity validation.
     /// Exit code 5.
     #[error("capacity check failed: {source}")]
     Capacity {
@@ -112,10 +113,12 @@ impl CliError {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Read`] when an input file cannot be read as UTF-8
+/// Returns [`CliError::Usage`] when the scope and quota flags contradict
+/// each other, [`CliError::Read`] when an input file cannot be read as UTF-8
 /// text, [`CliError::TraceParse`] or [`CliError::ManifestParse`] when a file
-/// is not a valid strict v1 document, and [`CliError::Capacity`] when the
-/// capacity feasibility pass rejects the configuration.
+/// is not a valid strict v1 document, [`CliError::Capacity`] when the
+/// capacity feasibility pass rejects the configuration, and
+/// [`CliError::Replay`] when replay itself fails afterwards.
 pub fn run(cli: &Cli) -> Result<String, CliError> {
     match &cli.command {
         Command::Trace(TraceCommand::Inspect(args)) => trace_inspect(args),

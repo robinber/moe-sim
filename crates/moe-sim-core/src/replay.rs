@@ -1685,6 +1685,23 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_peak_counts_simultaneous_residency_across_layers() {
+        // Retained caches: both layers are resident at once after the second
+        // event, so the aggregate peak must be their sum. An implementation
+        // that reported the largest individual layer peak would read 10.
+        let manifest = manifest_layers(&[(0, 0, 4), (0, 1, 6), (1, 0, 5), (1, 1, 3)]);
+        let events = [ev_on(0, vec![0, 1]), ev_on(1, vec![0, 1])];
+        let scope = per_layer(18, &[(0, 10), (1, 8)]);
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let metrics = replay(&manifest, &events, policy, &scope).unwrap();
+            assert_eq!(metrics.peak_resident_bytes(), 18, "{policy}");
+            assert_eq!(metrics.layer_peak_resident_bytes()[&0], 10, "{policy}");
+            assert_eq!(metrics.layer_peak_resident_bytes()[&1], 8, "{policy}");
+        }
+    }
+
+    #[test]
     fn per_layer_with_one_layer_matches_the_global_metrics() {
         // A single quota covering the whole budget is the same simulation as
         // a global cache of that size; only the layer breakdown differs.
