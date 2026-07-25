@@ -79,9 +79,10 @@ simulation claims yet.
 - [x] Define oversize expert and oversize active-set rejection.
 - [x] Define run provenance fields. Every success report names the tool
   version, the input contract version, and a SHA-256 digest of each input
-  document. Deterministic seed handling is **deferred** to the first slice that
-  introduces a stochastic policy (1B/1D): no command is stochastic today, and a
-  seed field with no consumer would be untestable scaffolding.
+  document. Deterministic seed handling is **deferred** to slice 1D, whose
+  random synthetic pattern is the first stochastic consumer: no command is
+  stochastic today, and a seed field with no consumer would be untestable
+  scaffolding.
 - [x] Add tiny valid and invalid fixtures.
 - [x] Document error behavior and compatibility rules.
 - [x] Add impact-scoped format, Clippy, test, and rustdoc checks.

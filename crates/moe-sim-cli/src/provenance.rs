@@ -1,9 +1,14 @@
 //! Provenance facts recorded in every `moe-sim` success report.
 //!
-//! A report identifies the build that produced it, the input-contract version
-//! it parsed against, and the exact bytes of every input document. Digests are
-//! lowercase hexadecimal SHA-256 over the raw file bytes, so a reader can
-//! reproduce any of them outside this tool with `shasum -a 256 <path>`.
+//! A report names the package version that produced it, the input-contract
+//! version it parsed against, and the exact bytes of every input document.
+//! Digests are lowercase hexadecimal SHA-256 over the input bytes as read, so
+//! a reader can reproduce any of them outside this tool with
+//! `shasum -a 256 <path>`.
+//!
+//! The package version is not a full build identity: it pins neither the
+//! source revision nor the dependency lock. Recording those is a separate
+//! decision, not something this module silently implies.
 //!
 //! Seeds are deliberately absent. No `moe-sim` command is stochastic yet;
 //! a seed field arrives with the first policy that needs randomness.
@@ -18,7 +23,11 @@ pub const INPUT_FORMAT_VERSION: &str = "v1";
 
 const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
 
-/// Version of the binary that produced a report.
+/// Package version of the binary that produced a report.
+///
+/// This is `CARGO_PKG_VERSION` alone. It identifies the released version, not
+/// the exact build: two binaries from different commits of the same version
+/// report the same string.
 #[must_use]
 pub fn tool_version() -> &'static str {
     env!("CARGO_PKG_VERSION")

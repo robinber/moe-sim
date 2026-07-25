@@ -151,7 +151,10 @@ moe-sim trace inspect --trace fixtures/synthetic/active-set-0-1.jsonl
 
 ```text
 status: ok
+tool_version: 0.1.0
+input_format: v1
 trace: fixtures/synthetic/active-set-0-1.jsonl
+trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
 events: 2
 requests: 1
 layers: 1
@@ -173,8 +176,12 @@ moe-sim capacity check \
 
 ```text
 status: ok
+tool_version: 0.1.0
+input_format: v1
 trace: fixtures/synthetic/active-set-0-1.jsonl
+trace_sha256: ba96fdf54901d5f93e090714c539b63aa748b1b845434a92522a77dee3744556
 model_manifest: fixtures/models/two-experts-4-6.json
+model_manifest_sha256: 543e2c3b70c52392b615dec923aa0c6a99a90ee88248ae5106b3093a89165538
 global_budget_bytes: 10
 events: 2
 manifest_experts: 2
