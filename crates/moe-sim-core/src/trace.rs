@@ -2,6 +2,13 @@
 
 use std::collections::HashSet;
 
+/// Longest active set validated by linear scan before the hash-set fallback.
+///
+/// The measured crossover on `aarch64` lies between 128 and 256 elements.
+/// Routed top-k active sets are far smaller, so the scan is the normal path;
+/// the fallback keeps malformed oversized sets from degrading quadratically.
+const LINEAR_SCAN_MAX_LEN: usize = 128;
+
 /// The execution phase of a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
@@ -33,12 +40,7 @@ pub struct EventParts {
 /// A single canonical activation event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    request_id: u64,
-    phase: Phase,
-    step_id: u64,
-    token_position: u64,
-    layer_id: u32,
-    expert_ids: Vec<u32>,
+    parts: EventParts,
 }
 
 /// Errors returned by [`Event`] construction.
@@ -61,53 +63,55 @@ impl Event {
     pub fn new(parts: EventParts) -> Result<Self, EventError> {
         Self::validate_expert_ids(&parts.expert_ids)?;
 
-        Ok(Self {
-            request_id: parts.request_id,
-            phase: parts.phase,
-            step_id: parts.step_id,
-            token_position: parts.token_position,
-            layer_id: parts.layer_id,
-            expert_ids: parts.expert_ids,
-        })
+        Ok(Self { parts })
     }
 
     /// Originating request identifier.
     #[must_use]
     pub fn request_id(&self) -> u64 {
-        self.request_id
+        self.parts.request_id
     }
 
     /// Execution phase.
     #[must_use]
     pub fn phase(&self) -> Phase {
-        self.phase
+        self.parts.phase
     }
 
     /// Step within the request.
     #[must_use]
     pub fn step_id(&self) -> u64 {
-        self.step_id
+        self.parts.step_id
     }
 
     /// Token position in the sequence.
     #[must_use]
     pub fn token_position(&self) -> u64 {
-        self.token_position
+        self.parts.token_position
     }
 
     /// Layer index.
     #[must_use]
     pub fn layer_id(&self) -> u32 {
-        self.layer_id
+        self.parts.layer_id
     }
 
     /// Experts forming one atomic active set (guaranteed no duplicates).
     #[must_use]
     pub fn expert_ids(&self) -> &[u32] {
-        &self.expert_ids
+        &self.parts.expert_ids
     }
 
     fn validate_expert_ids(expert_ids: &[u32]) -> Result<(), EventError> {
+        if expert_ids.len() <= LINEAR_SCAN_MAX_LEN {
+            for (index, &id) in expert_ids.iter().enumerate() {
+                if expert_ids[..index].contains(&id) {
+                    return Err(EventError::DuplicateExpert { expert_id: id });
+                }
+            }
+            return Ok(());
+        }
+
         let mut seen = HashSet::with_capacity(expert_ids.len());
         for &id in expert_ids {
             if !seen.insert(id) {
@@ -170,6 +174,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(event.phase(), Phase::Unknown);
+    }
+
+    fn parts_with_experts(expert_ids: Vec<u32>) -> EventParts {
+        EventParts {
+            request_id: 1,
+            phase: Phase::Decode,
+            step_id: 0,
+            token_position: 0,
+            layer_id: 0,
+            expert_ids,
+        }
+    }
+
+    fn unique_experts(len: usize) -> Vec<u32> {
+        (0..len).map(|id| u32::try_from(id).unwrap()).collect()
+    }
+
+    #[test]
+    fn event_accepts_unique_experts_above_scan_threshold() {
+        let expert_ids = unique_experts(LINEAR_SCAN_MAX_LEN + 1);
+        let event = Event::new(parts_with_experts(expert_ids.clone())).unwrap();
+
+        assert_eq!(event.expert_ids(), expert_ids.as_slice());
+    }
+
+    #[test]
+    fn event_rejects_duplicate_experts_above_scan_threshold() {
+        let mut expert_ids = unique_experts(LINEAR_SCAN_MAX_LEN + 1);
+        expert_ids.push(0);
+
+        let err = Event::new(parts_with_experts(expert_ids)).unwrap_err();
+
+        assert!(matches!(err, EventError::DuplicateExpert { expert_id: 0 }));
     }
 
     #[test]
