@@ -345,7 +345,10 @@ fn run_on_the_empty_trace_reports_zeroed_metrics() {
         "byte_loads",
         "object_hits",
         "byte_hits",
+        "object_reloads",
+        "byte_reloads",
         "evictions",
+        "evicted_bytes",
         "peak_resident_bytes",
     ] {
         assert_eq!(field(report, key), "0", "{key} must be zero: {report}");

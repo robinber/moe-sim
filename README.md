@@ -290,10 +290,15 @@ nothing, which keeps the baseline comparable with the caching policies measured
 against it.
 
 **Churn is rework, not turnover.** `object_reloads` and `byte_reloads` count
-loads of an expert that was loaded earlier in the run and evicted since, so
-`object_loads` splits into unavoidable cold misses plus reloads. That
-separation is what distinguishes a policy that thrashes from one that simply
-faces a large working set.
+loads of an expert that was loaded earlier in the run and is no longer
+resident, so `object_loads` splits into unavoidable cold misses plus reloads.
+That separation is what distinguishes a policy that thrashes from one that
+simply faces a large working set.
+
+Churn counts the rework, not its cause. A retaining policy loses residency by
+eviction; `no-cache` loses it by releasing the active set. So the baseline
+reports reloads while its `evictions` stay `0` — the pairing above is
+intended, and reading it as a broken report would be a mistake.
 
 `lfu` breaks ties by least recent use, and a frequency count belongs to a
 resident entry: it restarts when an object is admitted again, so a once-hot
@@ -301,8 +306,8 @@ expert does not become immortal after eviction.
 
 ### Planned commands
 
-`compare` belongs to Milestone 1 and is not available yet. Additional `run`
-policies (LRU, LFU, offline references) arrive with slices 1B and 1C:
+`compare` belongs to Milestone 1 and is not available yet. Offline reference
+policies arrive with slice 1C:
 
 ```bash
 moe-sim compare \

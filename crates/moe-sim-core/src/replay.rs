@@ -68,9 +68,9 @@ pub enum ReplayCounter {
     ObjectHits,
     /// Cumulative bytes served from residency.
     ByteHits,
-    /// Count of objects loaded again after an earlier eviction.
+    /// Count of objects loaded again after ceasing to be resident.
     ObjectReloads,
-    /// Cumulative bytes loaded again after an earlier eviction.
+    /// Cumulative bytes loaded again after ceasing to be resident.
     ByteReloads,
     /// Count of objects evicted to reclaim capacity.
     Evictions,
@@ -204,18 +204,23 @@ impl ReplayMetrics {
         self.byte_hits
     }
 
-    /// Objects loaded again after an earlier eviction: the churn metric.
+    /// Objects loaded again after ceasing to be resident: the churn metric.
     ///
     /// This is the share of [`Self::object_loads`] that is rework rather than
     /// unavoidable cold misses, so `object_loads` equals cold loads plus
     /// reloads. Neither number is derivable from the hit and eviction
     /// counters alone.
+    ///
+    /// Churn counts rework, not its cause. A retaining policy loses residency
+    /// by eviction, but [`Policy::NoCache`] loses it by releasing the active
+    /// set, so the baseline reports reloads while [`Self::evictions`] stays
+    /// zero. That pairing is intended, not a broken report.
     #[must_use]
     pub fn object_reloads(&self) -> u64 {
         self.object_reloads
     }
 
-    /// Bytes loaded again after an earlier eviction: the churn metric in
+    /// Bytes loaded again after ceasing to be resident: the churn metric in
     /// bytes.
     #[must_use]
     pub fn byte_reloads(&self) -> u64 {
@@ -360,9 +365,6 @@ pub fn replay<'a>(
             event_index,
         )?;
 
-        // The atomic set is now fully resident and pinned: residency peaks here.
-        metrics.peak_resident_bytes = metrics.peak_resident_bytes.max(cache.resident_bytes());
-
         cache.record_access(&pinned);
 
         if policy == Policy::NoCache {
@@ -370,6 +372,8 @@ pub fn replay<'a>(
             cache.clear();
         }
     }
+
+    metrics.peak_resident_bytes = cache.peak_resident_bytes();
 
     Ok(metrics)
 }
@@ -429,7 +433,8 @@ fn admit_missing(
         )?;
 
         // `insert` reports whether the key is new, so a repeat load is rework
-        // caused by an earlier eviction rather than a cold miss.
+        // rather than a cold miss. The cause may be eviction or, under
+        // no-cache, an ordinary release.
         if !ever_loaded.insert(key) {
             metrics.object_reloads = bump(
                 metrics.object_reloads,
@@ -465,6 +470,7 @@ struct ResidentCache {
     budget_bytes: u64,
     resident_bytes: u64,
     entries: BTreeMap<ExpertKey, ResidentEntry>,
+    peak_resident_bytes: u64,
     tick: u64,
 }
 
@@ -474,16 +480,13 @@ impl ResidentCache {
             budget_bytes,
             resident_bytes: 0,
             entries: BTreeMap::new(),
+            peak_resident_bytes: 0,
             tick: 0,
         }
     }
 
     fn contains(&self, key: ExpertKey) -> bool {
         self.entries.contains_key(&key)
-    }
-
-    fn resident_bytes(&self) -> u64 {
-        self.resident_bytes
     }
 
     fn free_bytes(&self) -> u64 {
@@ -502,6 +505,14 @@ impl ResidentCache {
             },
         );
         self.resident_bytes = self.resident_bytes.saturating_add(size_bytes);
+        // Sampled here rather than once per event: the high-water mark must
+        // reflect residency at the instant it changes, so an implementation
+        // that admitted before making room could not hide a transient excess.
+        self.peak_resident_bytes = self.peak_resident_bytes.max(self.resident_bytes);
+    }
+
+    fn peak_resident_bytes(&self) -> u64 {
+        self.peak_resident_bytes
     }
 
     /// Records one access to every key in `accessed`, in deterministic key
@@ -740,25 +751,52 @@ mod tests {
 
     #[test]
     fn lfu_frequency_restarts_after_readmission() {
-        // 0 is hot, then evicted, then re-admitted with a fresh count, so it
-        // loses the next eviction race against the now-hotter 1.
-        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        // Expert 0 is made hot (frequency 3), forced out by an atomic set that
+        // needs the whole budget, then re-admitted. On re-admission its count
+        // must restart at 1, which loses the next eviction race against expert
+        // 1 at frequency 2 — so 0 is dropped again and the final event reloads
+        // it.
+        //
+        // An LFU that carried the old lifetime frequency instead would give 0
+        // a count of 4, keep it resident, and turn that final event into a
+        // hit. The exact totals below are what separates the two semantics; a
+        // `>= 1` assertion would not, because expert 1 supplies a reload
+        // either way.
+        //
+        //   e0..e2 {0}     0 resident, frequency 3
+        //   e3     {1, 2}  needs the full budget, so 0 is evicted
+        //   e4     {1}     1 reaches frequency 2
+        //   e5     {0}     evicts 2 (lowest frequency), re-admits 0
+        //   e6     {3}     evicts 0 under a restarted count, keeps 1
+        //   e7     {0}     therefore a reload, not a hit
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5), (3, 5)]);
         let events = [
             ev(vec![0]),
             ev(vec![0]),
             ev(vec![0]),
+            ev(vec![1, 2]),
             ev(vec![1]),
-            ev(vec![2]),
-            ev(vec![1]),
+            ev(vec![0]),
+            ev(vec![3]),
             ev(vec![0]),
         ];
 
         let metrics = replay(&manifest, &events, Policy::Lfu, 10).unwrap();
 
-        assert!(
-            metrics.object_reloads() >= 1,
-            "an evicted object must not keep its old frequency"
+        assert_eq!(metrics.events(), 8);
+        assert_eq!(
+            metrics.object_hits(),
+            3,
+            "a carried count would hit 4 times"
         );
+        assert_eq!(metrics.object_loads(), 6, "a carried count would load 5");
+        assert_eq!(
+            metrics.object_reloads(),
+            2,
+            "a carried count would reload only once"
+        );
+        assert_eq!(metrics.byte_reloads(), 10);
+        assert_eq!(metrics.evictions(), 4);
     }
 
     // --- adversarial: atomic pinning ---
@@ -902,6 +940,55 @@ mod tests {
                 activations,
                 "{policy}"
             );
+        }
+    }
+
+    #[test]
+    fn the_identities_hold_for_multi_expert_and_empty_active_sets() {
+        // The singleton cycles above cannot catch a version that counted
+        // unique pinned keys instead of activation multiplicity, so this
+        // fixture mixes set sizes, an empty set, and variable expert sizes.
+        let manifest = manifest_of(&[(0, 1), (1, 2), (2, 3), (3, 5)]);
+        let sets = [
+            vec![0, 1],
+            vec![],
+            vec![2, 3],
+            vec![0],
+            vec![1, 2, 3],
+            vec![],
+            vec![0, 1, 2],
+            vec![3],
+        ];
+        let sizes = [1u64, 2, 3, 5];
+        let activations: u64 = sets
+            .iter()
+            .map(|set| u64::try_from(set.len()).unwrap())
+            .sum();
+        let activated_bytes: u64 = sets
+            .iter()
+            .flat_map(|set| set.iter().map(|&id| sizes[usize::try_from(id).unwrap()]))
+            .sum();
+        let events: Vec<Event> = sets.into_iter().map(ev).collect();
+
+        for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+            for budget in [11u64, 20] {
+                let metrics = replay(&manifest, &events, policy, budget).unwrap();
+                assert_eq!(
+                    metrics.object_hits() + metrics.object_loads(),
+                    activations,
+                    "{policy} at budget {budget}"
+                );
+                assert_eq!(
+                    metrics.byte_hits() + metrics.byte_loads(),
+                    activated_bytes,
+                    "{policy} at budget {budget}: byte dual of the partition"
+                );
+                assert!(
+                    metrics.object_reloads() <= metrics.object_loads(),
+                    "{policy}: reloads are a subset of loads"
+                );
+                assert!(metrics.peak_resident_bytes() <= budget, "{policy}");
+            }
         }
     }
 
