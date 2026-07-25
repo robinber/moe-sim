@@ -14,10 +14,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use moe_sim_core::{CapacityError, Event, ModelManifest, Phase};
+use moe_sim_core::{
+    CapacityError, Event, ModelManifest, Phase, ReplayError, ReplayMetrics, replay_no_cache,
+};
 
 use crate::cli::{
-    CapacityCheckArgs, CapacityCommand, Cli, Command, TraceCommand, TraceInspectArgs,
+    CapacityCheckArgs, CapacityCommand, Cli, Command, PolicyArg, RunArgs, TraceCommand,
+    TraceInspectArgs,
 };
 use crate::provenance::{INPUT_FORMAT_VERSION, sha256_hex, tool_version};
 use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trace_jsonl};
@@ -63,16 +66,30 @@ pub enum CliError {
         /// Underlying capacity feasibility error.
         source: CapacityError,
     },
+    /// Replay failed after the configuration was accepted. Exit code 6.
+    ///
+    /// `run` validates capacity before replaying, and that pass already
+    /// rejects unknown experts and per-event byte overflow, so this variant is
+    /// not reachable through the current command flow. It exists because
+    /// replay returns a fallible result that must not be discarded, and a
+    /// cumulative counter overflow has no earlier gate.
+    #[error("replay failed: {source}")]
+    Replay {
+        /// Underlying replay error.
+        source: ReplayError,
+    },
 }
 
 impl CliError {
-    /// Process exit code for this error: 3 read, 4 parse, 5 capacity.
+    /// Process exit code for this error: 3 read, 4 parse, 5 capacity, 6
+    /// replay.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Read { .. } => 3,
             Self::TraceParse { .. } | Self::ManifestParse { .. } => 4,
             Self::Capacity { .. } => 5,
+            Self::Replay { .. } => 6,
         }
     }
 }
@@ -89,7 +106,29 @@ pub fn run(cli: &Cli) -> Result<String, CliError> {
     match &cli.command {
         Command::Trace(TraceCommand::Inspect(args)) => trace_inspect(args),
         Command::Capacity(CapacityCommand::Check(args)) => capacity_check(args),
+        Command::Run(args) => run_replay(args),
     }
+}
+
+/// Executes `run`: read and parse both inputs, validate capacity, then replay.
+///
+/// Capacity is validated before replay so an infeasible configuration is
+/// rejected instead of producing metrics that describe a run which could not
+/// happen.
+fn run_replay(args: &RunArgs) -> Result<String, CliError> {
+    let trace = load_trace(&args.trace)?;
+    let manifest = load_manifest(&args.model_manifest)?;
+    manifest
+        .value
+        .validate_global_capacity(args.global_budget_bytes, trace.value.iter())
+        .map_err(|source| CliError::Capacity { source })?;
+
+    let metrics = match args.policy {
+        PolicyArg::NoCache => replay_no_cache(&manifest.value, trace.value.iter()),
+    }
+    .map_err(|source| CliError::Replay { source })?;
+
+    Ok(render_run(args, &trace.digest, &manifest.digest, &metrics))
 }
 
 /// Executes `trace inspect`: read, parse, summarize.
@@ -263,13 +302,62 @@ fn render_capacity_check(
     )
 }
 
+/// Renders the `run` success report.
+fn render_run(
+    args: &RunArgs,
+    trace_digest: &str,
+    manifest_digest: &str,
+    metrics: &ReplayMetrics,
+) -> String {
+    format!(
+        "status: ok\n\
+         tool_version: {}\n\
+         input_format: {INPUT_FORMAT_VERSION}\n\
+         trace: {}\n\
+         trace_sha256: {trace_digest}\n\
+         model_manifest: {}\n\
+         model_manifest_sha256: {manifest_digest}\n\
+         global_budget_bytes: {}\n\
+         policy: {}\n\
+         events: {}\n\
+         object_loads: {}\n\
+         byte_loads: {}\n\
+         object_hits: {}\n\
+         byte_hits: {}\n\
+         evictions: {}\n\
+         peak_resident_bytes: {}\n",
+        tool_version(),
+        args.trace.display(),
+        args.model_manifest.display(),
+        args.global_budget_bytes,
+        policy_name(args.policy),
+        metrics.events(),
+        metrics.object_loads(),
+        metrics.byte_loads(),
+        metrics.object_hits(),
+        metrics.byte_hits(),
+        metrics.evictions(),
+        metrics.peak_resident_bytes(),
+    )
+}
+
+/// Stable report name of a policy.
+///
+/// Owned here rather than derived from `clap` so the report contract cannot
+/// shift with an argument-parsing detail.
+fn policy_name(policy: PolicyArg) -> &'static str {
+    match policy {
+        PolicyArg::NoCache => "no-cache",
+    }
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
     reason = "tests construct valid events directly; direct unwraps keep failure diagnostics close to the fixture data"
 )]
 mod tests {
-    use moe_sim_core::{EventParts, ManifestError};
+    use moe_sim_core::{EventParts, ExpertKey, ExpertSizeEntry, ManifestError, ReplayCounter};
 
     use super::*;
 
@@ -371,6 +459,66 @@ mod tests {
                 tool_version()
             )
         );
+    }
+
+    #[test]
+    fn run_report_is_stable() {
+        let args = RunArgs {
+            trace: PathBuf::from("t.jsonl"),
+            model_manifest: PathBuf::from("m.json"),
+            global_budget_bytes: 10,
+            policy: PolicyArg::NoCache,
+        };
+        let manifest = ModelManifest::try_from_entries(vec![
+            ExpertSizeEntry {
+                key: ExpertKey::new(0, 0),
+                size_bytes: 4,
+            },
+            ExpertSizeEntry {
+                key: ExpertKey::new(0, 1),
+                size_bytes: 6,
+            },
+        ])
+        .unwrap();
+        let events = [
+            event(1, Phase::Prefill, 0, vec![0, 1]),
+            event(1, Phase::Decode, 0, vec![1]),
+        ];
+        let metrics = replay_no_cache(&manifest, events.iter()).unwrap();
+
+        assert_eq!(
+            render_run(&args, DIGEST, OTHER_DIGEST, &metrics),
+            format!(
+                "status: ok\n\
+             tool_version: {}\n\
+             input_format: v1\n\
+             trace: t.jsonl\n\
+             trace_sha256: {DIGEST}\n\
+             model_manifest: m.json\n\
+             model_manifest_sha256: {OTHER_DIGEST}\n\
+             global_budget_bytes: 10\n\
+             policy: no-cache\n\
+             events: 2\n\
+             object_loads: 3\n\
+             byte_loads: 16\n\
+             object_hits: 0\n\
+             byte_hits: 0\n\
+             evictions: 0\n\
+             peak_resident_bytes: 10\n",
+                tool_version()
+            )
+        );
+    }
+
+    #[test]
+    fn replay_failures_exit_with_their_own_code() {
+        let replay = CliError::Replay {
+            source: ReplayError::CounterOverflow {
+                counter: ReplayCounter::ByteLoads,
+                event_index: 0,
+            },
+        };
+        assert_eq!(replay.exit_code(), 6);
     }
 
     #[test]
