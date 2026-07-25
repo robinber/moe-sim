@@ -152,8 +152,10 @@ impl ReplayMetrics {
 /// [`ReplayMetrics::object_hits`], [`ReplayMetrics::byte_hits`], and
 /// [`ReplayMetrics::evictions`] are always zero.
 ///
-/// `events` is consumed as an iterator and never collected, so a caller may
-/// stream a trace it cannot hold in memory.
+/// `events` is iterated once and is never collected internally. The item bound
+/// is `&Event`, so every event must outlive the call and the caller therefore
+/// supplies the whole trace: this signature does not on its own replay a trace
+/// larger than memory.
 ///
 /// # Errors
 ///
