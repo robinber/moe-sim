@@ -6,11 +6,13 @@
 //! the fallible constructors in `moe-sim-core`; capacity feasibility stays a
 //! separate, later check and its errors are never folded into parse errors.
 //! Command orchestration and report rendering live in [`commands`] so the
-//! binary entrypoint stays thin glue.
+//! binary entrypoint stays thin glue, and every success report carries the
+//! [`provenance`] facts needed to identify the build and the exact inputs.
 
 pub mod cli;
 pub mod commands;
 pub mod manifest_json;
+pub mod provenance;
 pub mod trace_jsonl;
 
 pub use manifest_json::{
