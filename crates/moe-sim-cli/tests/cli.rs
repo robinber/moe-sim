@@ -192,12 +192,86 @@ fn run_no_cache_matches_the_hand_calculated_fixture() {
          byte_loads: 16\n\
          object_hits: 0\n\
          byte_hits: 0\n\
+         object_reloads: 1\n\
+         byte_reloads: 6\n\
          evictions: 0\n\
+         evicted_bytes: 0\n\
          peak_resident_bytes: 10\n",
             env!("CARGO_PKG_VERSION")
         )
     );
     assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn run_lru_retains_the_shared_expert_across_events() {
+    // Same fixture: event 0 loads {0, 1} = 10 bytes, event 1 needs {1} alone.
+    // LRU still holds expert 1, so the second event is a 6-byte hit instead of
+    // the reload the no-cache baseline pays.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-experts-4-6.json",
+        "--global-budget-bytes",
+        "10",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    assert_eq!(field(report, "policy"), "lru");
+    assert_eq!(field(report, "object_loads"), "2");
+    assert_eq!(field(report, "byte_loads"), "10");
+    assert_eq!(field(report, "object_hits"), "1");
+    assert_eq!(field(report, "byte_hits"), "6");
+    assert_eq!(field(report, "object_reloads"), "0");
+    assert_eq!(field(report, "evictions"), "0");
+    assert_eq!(field(report, "peak_resident_bytes"), "10");
+}
+
+#[test]
+fn every_policy_keeps_residency_within_the_budget() {
+    // The gate invariant, checked through the real binary rather than only in
+    // core: no policy may report residency above the budget it was given.
+    for policy in ["no-cache", "lru", "lfu"] {
+        let output = moe_sim(&[
+            "run",
+            "--trace",
+            "fixtures/synthetic/active-set-0-1.jsonl",
+            "--model-manifest",
+            "fixtures/models/two-experts-4-6.json",
+            "--global-budget-bytes",
+            "10",
+            "--policy",
+            policy,
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{policy}");
+        let peak: u64 = field(stdout(&output), "peak_resident_bytes")
+            .parse()
+            .unwrap();
+        assert!(peak <= 10, "{policy} reported peak residency {peak}");
+    }
+}
+
+#[test]
+fn every_policy_is_rejected_on_an_infeasible_budget() {
+    for policy in ["no-cache", "lru", "lfu"] {
+        let output = moe_sim(&[
+            "run",
+            "--trace",
+            "fixtures/synthetic/active-set-0-1.jsonl",
+            "--model-manifest",
+            "fixtures/models/two-experts-4-6.json",
+            "--global-budget-bytes",
+            "9",
+            "--policy",
+            policy,
+        ]);
+        assert_eq!(output.status.code(), Some(5), "{policy}");
+        assert_eq!(stdout(&output), "", "{policy} emitted metrics anyway");
+    }
 }
 
 #[test]
@@ -271,7 +345,10 @@ fn run_on_the_empty_trace_reports_zeroed_metrics() {
         "byte_loads",
         "object_hits",
         "byte_hits",
+        "object_reloads",
+        "byte_reloads",
         "evictions",
+        "evicted_bytes",
         "peak_resident_bytes",
     ] {
         assert_eq!(field(report, key), "0", "{key} must be zero: {report}");
@@ -309,10 +386,17 @@ fn run_with_an_unknown_policy_is_a_usage_error() {
         "--global-budget-bytes",
         "10",
         "--policy",
-        "lru",
+        // Belongs to slice 1C and is not implemented: an unsupported policy
+        // must be refused, never silently approximated by another one.
+        "belady",
     ]);
-    assert_eq!(output.status.code(), Some(2), "unsupported policy must not");
+    assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("belady"),
+        "stderr must name the rejected policy, got: {}",
+        stderr(&output)
+    );
 }
 
 // Bad argv (exit 2, reported by clap).

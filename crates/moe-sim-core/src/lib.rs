@@ -8,5 +8,5 @@ pub mod replay;
 pub mod trace;
 
 pub use manifest::{CapacityError, ExpertKey, ExpertSizeEntry, ManifestError, ModelManifest};
-pub use replay::{ReplayCounter, ReplayError, ReplayMetrics, replay_no_cache};
+pub use replay::{Policy, ReplayCounter, ReplayError, ReplayMetrics, replay};
 pub use trace::{Event, EventError, EventParts, Phase};

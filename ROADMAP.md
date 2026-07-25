@@ -142,10 +142,19 @@ pass — optional if you are not publishing.
 
 ### Slice 1B — Online policies and cache scopes
 
-- [ ] LRU and LFU (policy independent of scope).
-- [ ] One global budget.
-- [ ] Explicit fixed per-layer quotas (sum ≤ total budget).
-- [ ] Object hits, byte hits, loads, evictions, resident bytes, churn.
+- [x] LRU and LFU (policy independent of scope). A policy decides only which
+  unpinned object is evicted next, so the same policy applies unchanged when a
+  scope other than the global budget is added.
+- [x] One global budget.
+- [ ] Explicit fixed per-layer quotas (sum ≤ total budget). Split out as the
+  remaining half of this slice: it adds a configuration surface rather than
+  eviction logic, and the gate below is demonstrable without it.
+- [x] Object hits, byte hits, loads, evictions, resident bytes, churn. Churn is
+  **rework**: loads of an expert loaded earlier in the run and no longer
+  resident, so loads split into cold misses plus reloads. Turnover alone would
+  duplicate the eviction counter. Churn counts the rework, not its cause: a
+  retaining policy loses residency by eviction, no-cache by release, so the
+  baseline reports reloads with zero evictions.
 
 **Gate:** every policy respects atomic pinning and byte capacity on adversarial
 fixtures.
@@ -321,8 +330,9 @@ session is forced to advance a milestone counter.
 
 ## Next planning target
 
-**Current focus:** finish remaining **Milestone 0** contracts (fixtures, CLI
-stub, oversize rejection), then open **Milestone 1 slice 1A** only if still
+**Current focus:** Milestone 0 is closed and slice 1A shipped. Slice 1B is half
+delivered — LRU and LFU under one global budget — with per-layer quotas the
+remaining half. Open slice 1C only if an offline reference is still
 interesting.
 
 After any closed slice, the default next action is:
