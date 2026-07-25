@@ -8,7 +8,8 @@
 //! is made resident together, stays pinned for the whole event, and is
 //! released before the next event begins. No event is ever partially admitted,
 //! and no member of the current active set can be evicted to make room for
-//! another member of the same set.
+//! another member of the same set. The set also counts as a single access:
+//! recency and frequency never observe an order between members of one event.
 //!
 //! Resident bytes never exceed the supplied budget. When an atomic active set
 //! cannot fit even after evicting everything unpinned, replay fails instead of
@@ -25,6 +26,10 @@ use crate::trace::Event;
 /// A policy decides only which resident object is evicted next. It is
 /// independent of the budget it operates under, so the same policy can later
 /// be applied within a different cache scope.
+///
+/// One atomic active set counts as one access, so entries can tie on every
+/// policy criterion. A genuine tie evicts the lowest expert key first: an
+/// explicit rule, not an accident of iteration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Policy {
     /// Retain nothing between events.
@@ -36,11 +41,10 @@ pub enum Policy {
     Lru,
     /// Evict the least frequently used unpinned object.
     ///
-    /// Ties are broken by least recent use, which keeps the choice
-    /// deterministic without biasing eviction toward low expert identifiers.
-    /// A frequency count belongs to a resident entry and restarts when an
-    /// object is admitted again, so a once-hot object does not stay immortal
-    /// after eviction.
+    /// Ties are broken by least recent use, then by the lowest expert key
+    /// when entries were last accessed by the same event. A frequency count
+    /// belongs to a resident entry and restarts when an object is admitted
+    /// again, so a once-hot object does not stay immortal after eviction.
     Lfu,
 }
 
@@ -515,11 +519,12 @@ impl ResidentCache {
         self.peak_resident_bytes
     }
 
-    /// Records one access to every key in `accessed`, in deterministic key
-    /// order, so recency and frequency reflect this event.
+    /// Records one event's atomic active set as a single access: the tick
+    /// advances once and every member shares it, so recency never invents an
+    /// order between members of the same set.
     fn record_access(&mut self, accessed: &BTreeSet<ExpertKey>) {
+        self.tick = self.tick.saturating_add(1);
         for key in accessed {
-            self.tick = self.tick.saturating_add(1);
             if let Some(entry) = self.entries.get_mut(key) {
                 entry.frequency = entry.frequency.saturating_add(1);
                 entry.last_used_tick = self.tick;
@@ -529,6 +534,7 @@ impl ResidentCache {
 
     /// Evicts one unpinned object chosen by `policy`, returning its size.
     ///
+    /// Entries tied on every policy criterion lose by lowest expert key.
     /// Returns `None` when every resident object is pinned, which means the
     /// active set itself cannot fit.
     fn evict_one(&mut self, policy: Policy, pinned: &BTreeSet<ExpertKey>) -> Option<u64> {
@@ -536,12 +542,17 @@ impl ResidentCache {
             .entries
             .iter()
             .filter(|(key, _)| !pinned.contains(key))
-            .min_by(|(_, left), (_, right)| match policy {
-                Policy::Lfu => left
-                    .frequency
-                    .cmp(&right.frequency)
-                    .then(left.last_used_tick.cmp(&right.last_used_tick)),
-                Policy::Lru | Policy::NoCache => left.last_used_tick.cmp(&right.last_used_tick),
+            .min_by(|(left_key, left), (right_key, right)| {
+                let criteria = match policy {
+                    Policy::Lfu => left
+                        .frequency
+                        .cmp(&right.frequency)
+                        .then(left.last_used_tick.cmp(&right.last_used_tick)),
+                    Policy::Lru | Policy::NoCache => left.last_used_tick.cmp(&right.last_used_tick),
+                };
+                // Members of one atomic set share one access timestamp, so a
+                // genuine tie is possible and must be broken explicitly.
+                criteria.then(left_key.cmp(right_key))
             })
             .map(|(key, entry)| (*key, entry.size_bytes))?;
 
@@ -838,6 +849,54 @@ mod tests {
             assert_eq!(metrics.evictions(), 4, "{policy}");
             assert_eq!(metrics.object_reloads(), 2, "{policy}");
             assert_eq!(metrics.peak_resident_bytes(), 10, "{policy}");
+        }
+    }
+
+    // --- adversarial: one atomic set is one access ---
+
+    #[test]
+    fn a_genuine_tie_inside_one_atomic_set_evicts_the_lowest_key() {
+        // {0, 1} are admitted and accessed by the same event, so they tie on
+        // recency and on frequency. The documented rule evicts the lowest
+        // expert key first: after {2} forces one eviction, a final access to
+        // 1 hits while a final access to 0 reloads, under both policies.
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let survivor = replay(
+                &manifest,
+                &[ev(vec![0, 1]), ev(vec![2]), ev(vec![1])],
+                policy,
+                10,
+            )
+            .unwrap();
+            let victim = replay(
+                &manifest,
+                &[ev(vec![0, 1]), ev(vec![2]), ev(vec![0])],
+                policy,
+                10,
+            )
+            .unwrap();
+
+            assert_eq!(survivor.object_hits(), 1, "{policy}: 1 must survive");
+            assert_eq!(survivor.object_reloads(), 0, "{policy}");
+            assert_eq!(victim.object_hits(), 0, "{policy}: 0 loses the tie");
+            assert_eq!(victim.object_reloads(), 1, "{policy}");
+        }
+    }
+
+    #[test]
+    fn activation_order_inside_an_event_never_orders_recency() {
+        // An atomic set is one access, so the order of `expert_ids` in the
+        // event must not decide which member a later eviction removes.
+        let manifest = manifest_of(&[(0, 5), (1, 5), (2, 5)]);
+        let ascending = [ev(vec![0, 1]), ev(vec![2]), ev(vec![1])];
+        let descending = [ev(vec![1, 0]), ev(vec![2]), ev(vec![1])];
+
+        for policy in [Policy::Lru, Policy::Lfu] {
+            let from_ascending = replay(&manifest, &ascending, policy, 10).unwrap();
+            let from_descending = replay(&manifest, &descending, policy, 10).unwrap();
+            assert_eq!(from_ascending, from_descending, "{policy}");
         }
     }
 

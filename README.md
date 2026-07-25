@@ -302,7 +302,9 @@ intended, and reading it as a broken report would be a mistake.
 
 `lfu` breaks ties by least recent use, and a frequency count belongs to a
 resident entry: it restarts when an object is admitted again, so a once-hot
-expert does not become immortal after eviction.
+expert does not become immortal after eviction. One atomic active set counts
+as one access, so members of the same event can tie on every criterion; a
+genuine tie evicts the lowest expert key first, as an explicit rule.
 
 ### Planned commands
 
