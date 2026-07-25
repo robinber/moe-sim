@@ -77,8 +77,12 @@ simulation claims yet.
 - [x] Define file-order replay and atomic active-set semantics.
 - [x] Define the minimal expert-size manifest.
 - [x] Define oversize expert and oversize active-set rejection.
-- [ ] Define run provenance fields and deterministic seed handling.
-- [ ] Add tiny valid and invalid fixtures.
+- [x] Define run provenance fields. Every success report names the tool
+  version, the input contract version, and a SHA-256 digest of each input
+  document. Deterministic seed handling is **deferred** to the first slice that
+  introduces a stochastic policy (1B/1D): no command is stochastic today, and a
+  seed field with no consumer would be untestable scaffolding.
+- [x] Add tiny valid and invalid fixtures.
 - [x] Document error behavior and compatibility rules.
 - [x] Add impact-scoped format, Clippy, test, and rustdoc checks.
 - [ ] Optional: pin a reference CI runner if/when resource gates matter.
@@ -163,6 +167,9 @@ and
 - [ ] Text, JSON, and CSV output.
 - [ ] Deterministic synthetic patterns (repetition, random, cyclic, hotset
   shifts, variable sizes, adversarial LRU).
+- [ ] Deterministic seed handling, deferred here from M0: the random pattern is
+  the first stochastic consumer. Record the seed in report provenance beside
+  the existing tool, contract, and digest fields.
 - [ ] Optional stress fixture (e.g. ~100k events) for local regression — keep
   it regenerable; do not bloat the repo.
 
