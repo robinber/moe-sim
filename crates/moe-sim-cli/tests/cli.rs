@@ -51,6 +51,15 @@ fn stderr(output: &Output) -> &str {
     std::str::from_utf8(&output.stderr).unwrap()
 }
 
+/// Value of one `key: value` line in a report.
+fn field<'a>(report: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}: ");
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("report has no `{key}` line:\n{report}"))
+}
+
 // Success paths (exit 0).
 
 #[test]
@@ -143,6 +152,167 @@ fn capacity_check_accepts_the_exact_fit_budget_10() {
         )
     );
     assert_eq!(stderr(&output), "");
+}
+
+// `run` (slice 1A): replay under one policy.
+
+#[test]
+fn run_no_cache_matches_the_hand_calculated_fixture() {
+    // fixtures/synthetic/active-set-0-1.jsonl over two-experts-4-6.json:
+    //   event 0 activates {0, 1} -> 4 + 6 = 10 bytes, 2 objects
+    //   event 1 activates {1}    ->         6 bytes,  1 object
+    // No retention, so every activation is a load: 3 objects, 16 bytes,
+    // and residency peaks at the largest atomic set, 10 bytes.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-experts-4-6.json",
+        "--global-budget-bytes",
+        "10",
+        "--policy",
+        "no-cache",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
+         trace: fixtures/synthetic/active-set-0-1.jsonl\n\
+         trace_sha256: {ACTIVE_SET_SHA256}\n\
+         model_manifest: fixtures/models/two-experts-4-6.json\n\
+         model_manifest_sha256: {TWO_EXPERTS_SHA256}\n\
+         global_budget_bytes: 10\n\
+         policy: no-cache\n\
+         events: 2\n\
+         object_loads: 3\n\
+         byte_loads: 16\n\
+         object_hits: 0\n\
+         byte_hits: 0\n\
+         evictions: 0\n\
+         peak_resident_bytes: 10\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn run_object_loads_equal_the_activation_count_reported_by_trace_inspect() {
+    // Cross-check between two independent commands: with no retention every
+    // activation is one load, so `run` must agree with `trace inspect`.
+    let inspect = moe_sim(&[
+        "trace",
+        "inspect",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+    ]);
+    let run = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-experts-4-6.json",
+        "--global-budget-bytes",
+        "10",
+        "--policy",
+        "no-cache",
+    ]);
+
+    let activations = field(stdout(&inspect), "expert_activations");
+    let object_loads = field(stdout(&run), "object_loads");
+    assert_eq!(activations, object_loads);
+}
+
+#[test]
+fn run_rejects_an_infeasible_budget_before_emitting_metrics() {
+    // The atomic set {0, 1} needs 10 bytes; each expert alone fits in 9.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-experts-4-6.json",
+        "--global-budget-bytes",
+        "9",
+        "--policy",
+        "no-cache",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout(&output), "", "rejection must not emit metrics");
+    assert!(
+        stderr(&output).starts_with("error: capacity check failed:"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn run_on_the_empty_trace_reports_zeroed_metrics() {
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/empty.jsonl",
+        "--model-manifest",
+        "fixtures/models/empty.json",
+        "--global-budget-bytes",
+        "0",
+        "--policy",
+        "no-cache",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    for key in [
+        "events",
+        "object_loads",
+        "byte_loads",
+        "object_hits",
+        "byte_hits",
+        "evictions",
+        "peak_resident_bytes",
+    ] {
+        assert_eq!(field(report, key), "0", "{key} must be zero: {report}");
+    }
+}
+
+#[test]
+fn run_without_a_policy_is_a_usage_error() {
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-experts-4-6.json",
+        "--global-budget-bytes",
+        "10",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("--policy"),
+        "stderr must name the missing flag, got: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn run_with_an_unknown_policy_is_a_usage_error() {
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/active-set-0-1.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-experts-4-6.json",
+        "--global-budget-bytes",
+        "10",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "unsupported policy must not");
+    assert_eq!(stdout(&output), "");
 }
 
 // Bad argv (exit 2, reported by clap).
