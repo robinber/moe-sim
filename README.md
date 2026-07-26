@@ -445,7 +445,7 @@ The following two commands reproduce a full synthetic comparison from a
 clean checkout (after `cargo build`):
 
 ```bash
-moe-sim trace generate \
+./target/debug/moe-sim trace generate \
   --pattern cyclic \
   --experts 3 \
   --events 6 \
@@ -484,7 +484,7 @@ against a variable-size manifest — rejects the whole comparison instead of
 emitting a partial table:
 
 ```bash
-moe-sim compare \
+./target/debug/moe-sim compare \
   --trace target/cycle.jsonl \
   --model-manifest target/cycle-manifest.json \
   --global-budgets-bytes 2,3 \
