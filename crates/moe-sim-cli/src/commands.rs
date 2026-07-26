@@ -704,6 +704,7 @@ mod tests {
             (Policy::NoCache, "no-cache"),
             (Policy::Lru, "lru"),
             (Policy::Lfu, "lfu"),
+            (Policy::Belady, "belady"),
         ] {
             let args = RunArgs {
                 trace: PathBuf::from("t.jsonl"),
@@ -725,6 +726,19 @@ mod tests {
                 rendered.contains(&format!("policy: {expected}\n")),
                 "{policy} rendered as: {rendered}"
             );
+            // The objective label belongs to the offline reference alone,
+            // and sits between the policy line and the metrics.
+            if policy == Policy::Belady {
+                assert!(
+                    rendered.contains("policy: belady\nobjective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)\nevents:"),
+                    "belady rendered as: {rendered}"
+                );
+            } else {
+                assert!(
+                    !rendered.contains("objective:"),
+                    "{policy} rendered as: {rendered}"
+                );
+            }
         }
     }
 

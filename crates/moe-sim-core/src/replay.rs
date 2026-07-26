@@ -383,10 +383,11 @@ impl ReplayMetrics {
 /// never evicts; the applicable capacity still bounds each individual active
 /// set.
 ///
-/// `events` is collected before the first event is replayed:
-/// [`Policy::Belady`] chooses victims from the schedule beyond the current
-/// event, and the `&Event` item bound already makes the caller supply the
-/// whole trace. This function does not replay a trace larger than memory.
+/// `events` is iterated once. [`Policy::Belady`] first collects it, because
+/// victim choice reads the schedule beyond the current event; the online
+/// policies stream it and never materialize the trace. Either way the
+/// `&Event` item bound makes the caller supply the whole trace, so this
+/// signature does not on its own replay a trace larger than memory.
 ///
 /// # Errors
 ///
@@ -412,20 +413,40 @@ pub fn replay<'a>(
     policy: Policy,
     scope: &CacheScope,
 ) -> Result<ReplayMetrics, ReplayError> {
-    let events: Vec<&'a Event> = events.into_iter().collect();
-    let next_uses = if policy == Policy::Belady {
+    if policy == Policy::Belady {
         ensure_uniform_expert_size(manifest)?;
-        Some(next_use_schedule(&events))
+        let events: Vec<&'a Event> = events.into_iter().collect();
+        let schedule = next_use_schedule(&events);
+        replay_events(
+            manifest,
+            events.iter().copied(),
+            policy,
+            scope,
+            Some(&schedule),
+        )
     } else {
-        None
-    };
+        replay_events(manifest, events.into_iter(), policy, scope, None)
+    }
+}
 
+/// The replay loop shared by every policy.
+///
+/// `next_uses` carries Belady's precomputed schedule, one slice per event
+/// aligned with that event's `expert_ids` order; online policies pass `None`
+/// and their events stream straight from the caller's iterator.
+fn replay_events<'a>(
+    manifest: &ModelManifest,
+    events: impl Iterator<Item = &'a Event>,
+    policy: Policy,
+    scope: &CacheScope,
+    next_uses: Option<&[Vec<Option<usize>>]>,
+) -> Result<ReplayMetrics, ReplayError> {
     let mut metrics = ReplayMetrics::default();
     let mut caches = ScopedCaches::new(scope)?;
     let mut ever_loaded: BTreeSet<ExpertKey> = BTreeSet::new();
     let mut peak_total_bytes: u64 = 0;
 
-    for (event_index, &event) in events.iter().enumerate() {
+    for (event_index, event) in events.enumerate() {
         let layer_id = event.layer_id();
         let request_id = event.request_id();
         let active_set_bytes =
@@ -510,7 +531,7 @@ pub fn replay<'a>(
 
         cache.record_access(&pinned);
 
-        if let Some(schedule) = &next_uses {
+        if let Some(schedule) = next_uses {
             record_event_next_uses(cache, event, &schedule[event_index]);
         }
 

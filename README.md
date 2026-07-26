@@ -19,8 +19,9 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 **Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
 (atomic-set validation), an explicit expert-size `ModelManifest`, and
 deterministic replay with byte-accurate accounting under no-cache, LRU, LFU,
-and an offline Belady reference checked against a bounded exhaustive oracle —
-within one global budget or under explicit fixed per-layer quotas. The
+and an offline Belady reference whose results the test suite checks against a
+bounded exhaustive oracle on enumerated tiny cases — within one global budget
+or under explicit fixed per-layer quotas. The
 intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
 byte budgets. Everything beyond that is optional curiosity, not a tunnel to
 finish.
@@ -475,14 +476,18 @@ the storage-simulation milestone establishes a real need.
 
 ## Offline baselines
 
-Classic Belady MIN is optimal for uniform-size pages. Once expert objects have
+Classic Belady MIN is proven optimal for single-object requests of uniform
+size; atomic active sets fall outside that proof, which is why the belady
+section above claims oracle-checked equality on enumerated cases rather than
+optimality. Once expert objects have
 different sizes or fetch costs, the general offline caching problem is
 NP-hard. `moe-sim` will therefore not describe a scalable greedy
 "byte-aware Belady" implementation as an optimum.
 
 `v0.1` uses classic Belady on uniform-size fixtures and a deliberately
 bounded exhaustive solver for tiny variable-size correctness tests, both
-shipped with slice 1C. Practical
+landed with slice 1C — Belady on the CLI, the solver as a test-only gate.
+Practical
 bounds for large variable-size traces are a separate research feature. See
 [Practical Bounds on Optimal Caching with Variable Object Sizes](https://arxiv.org/abs/1711.03709)
 and [General Caching Is Hard: Even with Small Pages](https://arxiv.org/abs/1506.07905).

@@ -117,6 +117,13 @@ fn uniform_and_empty_manifests_are_accepted_for_belady() {
     let empty = manifest_of(&[]);
     let metrics = replay_global(&empty, &[], Policy::Belady, 0).unwrap();
     assert_eq!(metrics.events(), 0);
+
+    // A single-expert manifest is trivially uniform and replays normally.
+    let single = manifest_of(&[(0, 4)]);
+    let events = [ev(vec![0]), ev(vec![0])];
+    let metrics = replay_global(&single, &events, Policy::Belady, 4).unwrap();
+    assert_eq!(metrics.object_loads(), 1);
+    assert_eq!(metrics.object_hits(), 1);
 }
 
 #[test]
@@ -204,4 +211,52 @@ fn belady_replay_is_deterministic() {
     let first = replay(&manifest, &events, Policy::Belady, &scope).unwrap();
     let second = replay(&manifest, &events, Policy::Belady, &scope).unwrap();
     assert_eq!(first, second);
+}
+
+#[test]
+fn an_expert_id_shared_across_layers_never_leaks_into_a_schedule() {
+    // Layer 1 reuses expert id 2. A schedule keyed by expert id alone would
+    // import layer 1's activation as layer-0 expert 2's next use, evict
+    // expert 0 instead of the never-reused expert 2 at the fourth event,
+    // and finish with 5 loads, no hit, and 2 evictions.
+    let manifest = manifest_layers(&[(0, 0, 1), (0, 1, 1), (0, 2, 1), (1, 2, 1)]);
+    let events = [
+        ev_on(0, vec![2]),
+        ev_on(1, vec![2]),
+        ev_on(0, vec![0]),
+        ev_on(0, vec![1]),
+        ev_on(0, vec![0]),
+    ];
+
+    let metrics = replay(
+        &manifest,
+        &events,
+        Policy::Belady,
+        &per_layer(4, &[(0, 2), (1, 2)]),
+    )
+    .unwrap();
+    assert_eq!(metrics.object_loads(), 4);
+    assert_eq!(metrics.object_hits(), 1);
+    assert_eq!(metrics.evictions(), 1);
+}
+
+#[test]
+fn a_genuine_belady_tie_evicts_the_lowest_key_itself() {
+    // Aggregate metrics reconverge after a tie (the tied pair shares its
+    // next event), so the victim's identity is pinned directly on the
+    // cache: equal next uses lose by lowest key, and "never activated
+    // again" loses to any scheduled use.
+    let mut cache = ResidentCache::new(4);
+    cache.admit(ExpertKey::new(0, 0), 2);
+    cache.admit(ExpertKey::new(0, 1), 2);
+    cache.record_next_use(ExpertKey::new(0, 0), Some(7));
+    cache.record_next_use(ExpertKey::new(0, 1), Some(7));
+    assert_eq!(cache.evict_one(Policy::Belady, &BTreeSet::new()), Some(2));
+    assert!(!cache.contains(ExpertKey::new(0, 0)));
+    assert!(cache.contains(ExpertKey::new(0, 1)));
+
+    cache.admit(ExpertKey::new(0, 0), 2);
+    assert_eq!(cache.evict_one(Policy::Belady, &BTreeSet::new()), Some(2));
+    assert!(!cache.contains(ExpertKey::new(0, 0)));
+    assert!(cache.contains(ExpertKey::new(0, 1)));
 }

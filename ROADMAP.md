@@ -332,8 +332,9 @@ session is forced to advance a milestone counter.
 ## Next planning target
 
 **Current focus:** Milestone 0 is closed; slices 1A, 1B, and 1C have shipped —
-no-cache, LRU, LFU, and an oracle-checked offline Belady reference under one
-global budget or explicit per-layer quotas. Slice 1D (`compare` and outputs)
+no-cache, LRU, LFU, and an offline Belady reference (checked in the test
+suite against a bounded exhaustive oracle) under one global budget or
+explicit per-layer quotas. Slice 1D (`compare` and outputs)
 is the last slice before the `v0.1` exit criteria; open it only if the
 comparison surface is still interesting.
 

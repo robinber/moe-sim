@@ -972,3 +972,21 @@ fn unactivated_quota_layers_report_a_zero_peak() {
         &[(0u32, 5u64), (1u32, 0u64)].into_iter().collect()
     );
 }
+
+#[test]
+fn online_policies_stream_events_and_stop_at_the_first_error() {
+    // The tail iterator panics if polled: an online policy must return the
+    // first event's typed error without materializing the rest of the trace.
+    let manifest = manifest_of(&[(0, 4)]);
+    let bad = ev(vec![9]);
+    for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+        let events = std::iter::once(&bad).chain(std::iter::from_fn(|| -> Option<&Event> {
+            panic!("the tail of the trace must not be polled after an error")
+        }));
+        let error = replay_global(&manifest, events, policy, 4).unwrap_err();
+        assert!(
+            matches!(error, ReplayError::ActiveSetBytes { event_index: 0, .. }),
+            "unexpected error for {policy}: {error}"
+        );
+    }
+}

@@ -65,8 +65,10 @@ fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
 ///
 /// # Errors
 ///
-/// Refuses traces beyond the declared bounds, and traces whose atomic active
-/// set cannot fit the budget at all.
+/// Refuses traces beyond the declared bounds, traces whose atomic active set
+/// cannot fit the budget at all, and traces whose exact byte total would
+/// overflow `u64` — an exact oracle must refuse what it cannot represent
+/// instead of relying on build-mode overflow behavior.
 fn oracle_min_loaded_bytes(
     manifest: &ModelManifest,
     events: &[Event],
@@ -99,13 +101,14 @@ fn oracle_min_loaded_bytes(
         .iter()
         .map(|&key| manifest.size_bytes(key).unwrap())
         .collect();
-    let mask_bytes = |mask: usize| -> u64 {
+    // `None` marks a byte total beyond `u64`: such a set can never fit a
+    // `u64` budget, and a cost that reaches it must be refused.
+    let mask_bytes = |mask: usize| -> Option<u64> {
         sizes
             .iter()
             .enumerate()
             .filter(|&(expert, _)| mask & (1 << expert) != 0)
-            .map(|(_, &size)| size)
-            .sum()
+            .try_fold(0u64, |total, (_, &size)| total.checked_add(size))
     };
 
     let states = 1usize << keys.len();
@@ -116,7 +119,7 @@ fn oracle_min_loaded_bytes(
             let key = ExpertKey::new(event.layer_id(), expert_id);
             mask | (1 << keys.iter().position(|&candidate| candidate == key).unwrap())
         });
-        if mask_bytes(active_mask) > budget_bytes {
+        if mask_bytes(active_mask).is_none_or(|active_bytes| active_bytes > budget_bytes) {
             return Err("an atomic active set exceeds the budget".to_owned());
         }
         let mut next_best: Vec<Option<u64>> = vec![None; states];
@@ -124,12 +127,17 @@ fn oracle_min_loaded_bytes(
             let Some(cost) = reachable else {
                 continue;
             };
-            let cost = cost + mask_bytes(active_mask & !resident_mask);
+            // The missing members are a subset of the checked active set, so
+            // their byte total cannot overflow.
+            let loaded = mask_bytes(active_mask & !resident_mask).unwrap();
+            let Some(cost) = cost.checked_add(loaded) else {
+                return Err("the oracle's byte total overflowed u64".to_owned());
+            };
             let optional = resident_mask & !active_mask;
             let mut keep = optional;
             loop {
                 let state = keep | active_mask;
-                if mask_bytes(state) <= budget_bytes
+                if mask_bytes(state).is_some_and(|state_bytes| state_bytes <= budget_bytes)
                     && next_best[state].is_none_or(|existing| cost < existing)
                 {
                     next_best[state] = Some(cost);
@@ -248,6 +256,13 @@ fn the_oracle_refuses_cases_beyond_its_declared_bounds() {
     let infeasible = vec![ev_on(0, vec![0, 1])];
     let error = oracle_min_loaded_bytes(&pair, &infeasible, 1).unwrap_err();
     assert_eq!(error, "an atomic active set exceeds the budget");
+
+    // Each demand fits the budget on its own, but the exact total does not
+    // fit u64: the oracle refuses instead of wrapping or panicking.
+    let huge = manifest_layers(&[(0, 0, u64::MAX - 1), (0, 1, u64::MAX - 1)]);
+    let overflowing = vec![ev_on(0, vec![0]), ev_on(0, vec![1])];
+    let error = oracle_min_loaded_bytes(&huge, &overflowing, u64::MAX).unwrap_err();
+    assert_eq!(error, "the oracle's byte total overflowed u64");
 }
 
 #[test]

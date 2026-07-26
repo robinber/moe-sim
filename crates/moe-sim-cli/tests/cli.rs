@@ -4,8 +4,7 @@
 //! frozen process contract:
 //!
 //! - exit codes: 0 ok, 2 bad argv, 3 read/UTF-8/path, 4 parse/domain wire, 5
-//!   capacity rejection, 6 replay rejection (belady on a variable-size
-//!   manifest);
+//!   capacity rejection, 6 replay failure;
 //! - stdout carries only complete success reports; failures never emit partial
 //!   stdout;
 //! - stderr carries one `error:` line with the full typed error chain.
