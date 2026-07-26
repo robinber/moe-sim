@@ -176,14 +176,14 @@ and
 
 ### Slice 1D — Comparison and outputs
 
-- [ ] `compare` command.
-- [ ] Text, JSON, and CSV output.
-- [ ] Deterministic synthetic patterns (repetition, random, cyclic, hotset
+- [x] `compare` command.
+- [x] Text, JSON, and CSV output.
+- [x] Deterministic synthetic patterns (repetition, random, cyclic, hotset
   shifts, variable sizes, adversarial LRU).
-- [ ] Deterministic seed handling, deferred here from M0: the random pattern is
+- [x] Deterministic seed handling, deferred here from M0: the random pattern is
   the first stochastic consumer. Record the seed in report provenance beside
   the existing tool, contract, and digest fields.
-- [ ] Optional stress fixture (e.g. ~100k events) for local regression — keep
+- [x] Optional stress fixture (e.g. ~100k events) for local regression — keep
   it regenerable; do not bloat the repo.
 
 **Gate (exploratory, lightweight):** repeated runs on the same inputs produce
@@ -331,12 +331,14 @@ session is forced to advance a milestone counter.
 
 ## Next planning target
 
-**Current focus:** Milestone 0 is closed; slices 1A, 1B, and 1C have shipped —
-no-cache, LRU, LFU, and an offline Belady reference (checked in the test
-suite against a bounded exhaustive oracle) under one global budget or
-explicit per-layer quotas. Slice 1D (`compare` and outputs)
-is the last slice before the `v0.1` exit criteria; open it only if the
-comparison surface is still interesting.
+**Current focus:** Milestone 0 is closed and every Milestone 1 slice
+(1A–1D) has shipped: no-cache, LRU, LFU, and the oracle-checked offline
+Belady reference replay under one global budget or explicit per-layer
+quotas, and the CLI generates deterministic synthetic traces and compares
+policies across budget sweeps in text, JSON, and CSV. The `v0.1` exit
+criteria are met by the shipped surface; declaring `v0.1` — and whether to
+stop there, which this roadmap recommends as the default — is the
+operator's decision, not an implementation task.
 
 After any closed slice, the default next action is:
 
