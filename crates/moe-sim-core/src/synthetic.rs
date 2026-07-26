@@ -25,6 +25,14 @@ pub const MAX_EXPERTS: u32 = 65_536;
 /// Most events one pattern may generate in memory, for the same reason.
 pub const MAX_EVENTS: u64 = 10_000_000;
 
+/// Most total activations (`events × active_per_event`) one pattern may
+/// generate.
+///
+/// The per-count bounds do not compose: the widest atomic set at the most
+/// events would be hundreds of billions of expert ids, so the product is
+/// bounded on its own before anything allocates.
+pub const MAX_TOTAL_ACTIVATIONS: u64 = 50_000_000;
+
 /// One synthetic trace family and its parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntheticPattern {
@@ -116,6 +124,14 @@ pub enum SyntheticError {
         /// The declared bound, [`MAX_EVENTS`].
         limit: u64,
     },
+    /// The pattern's total activation count exceeds the generator's bound.
+    #[error("a synthetic pattern is bounded to {limit} total activations: got {activations}")]
+    TooManyActivations {
+        /// Requested `events × active_per_event`, saturated at `u64::MAX`.
+        activations: u64,
+        /// The declared bound, [`MAX_TOTAL_ACTIVATIONS`].
+        limit: u64,
+    },
     /// The atomic set must have between 1 member and the expert count.
     #[error(
         "active_per_event must be between 1 and the expert count: got {active_per_event} of {experts}"
@@ -168,9 +184,11 @@ pub struct SyntheticCase {
 /// # Errors
 ///
 /// Returns the [`SyntheticError`] naming the impossible parameter: zero
-/// experts, counts beyond [`MAX_EXPERTS`] or [`MAX_EVENTS`], an atomic set
-/// outside `1..=experts`, a hot window outside `1..=experts`, a zero shift
-/// period, or fewer than two experts for the adversarial scan.
+/// experts, counts beyond [`MAX_EXPERTS`], [`MAX_EVENTS`], or
+/// [`MAX_TOTAL_ACTIVATIONS`], an atomic set outside `1..=experts`, a hot
+/// window outside `1..=experts`, a zero shift period, or fewer than two
+/// experts for the adversarial scan. Every bound is checked before anything
+/// allocates.
 pub fn generate(pattern: &SyntheticPattern) -> Result<SyntheticCase, SyntheticError> {
     ensure_bounds(pattern)?;
     match *pattern {
@@ -290,6 +308,29 @@ fn ensure_bounds(pattern: &SyntheticPattern) -> Result<(), SyntheticError> {
         return Err(SyntheticError::TooManyEvents {
             events,
             limit: MAX_EVENTS,
+        });
+    }
+
+    // The per-count bounds do not compose, so the product is bounded on its
+    // own. With `events <= MAX_EVENTS` and a `u32` width the product fits
+    // u64, so the saturation is defensive only.
+    let active_per_event: u32 = match *pattern {
+        SyntheticPattern::Repetition {
+            active_per_event, ..
+        }
+        | SyntheticPattern::Random {
+            active_per_event, ..
+        } => active_per_event,
+        SyntheticPattern::Cyclic { .. }
+        | SyntheticPattern::HotsetShift { .. }
+        | SyntheticPattern::VariableSizes { .. }
+        | SyntheticPattern::AdversarialLru { .. } => 1,
+    };
+    let activations = events.saturating_mul(u64::from(active_per_event));
+    if activations > MAX_TOTAL_ACTIVATIONS {
+        return Err(SyntheticError::TooManyActivations {
+            activations,
+            limit: MAX_TOTAL_ACTIVATIONS,
         });
     }
     Ok(())

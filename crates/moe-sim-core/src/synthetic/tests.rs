@@ -313,3 +313,66 @@ fn random_seed_42_produces_the_pinned_sequence() {
         ]
     );
 }
+
+#[test]
+fn total_activations_are_bounded_before_any_allocation() {
+    // At the bound exactly (10M events × width 5 = MAX_TOTAL_ACTIVATIONS)
+    // the product check passes: the *next* validation fires instead, which
+    // proves acceptance at the limit without allocating anything.
+    assert_eq!(
+        generate(&SyntheticPattern::Repetition {
+            experts: 2,
+            active_per_event: 5,
+            events: 10_000_000,
+        })
+        .unwrap_err(),
+        SyntheticError::ActiveSetSize {
+            active_per_event: 5,
+            experts: 2,
+        }
+    );
+
+    // One step past the bound on the same axis.
+    assert_eq!(
+        generate(&SyntheticPattern::Repetition {
+            experts: 2,
+            active_per_event: 6,
+            events: 10_000_000,
+        })
+        .unwrap_err(),
+        SyntheticError::TooManyActivations {
+            activations: 60_000_000,
+            limit: MAX_TOTAL_ACTIVATIONS,
+        }
+    );
+
+    // The extreme case: ~655 billion ids, > 2.5 TB of u32s. Returning the
+    // typed error instantly is itself the no-allocation evidence — an
+    // implementation that allocated first would OOM here, not answer.
+    assert_eq!(
+        generate(&SyntheticPattern::Repetition {
+            experts: 65_536,
+            active_per_event: 65_536,
+            events: 10_000_000,
+        })
+        .unwrap_err(),
+        SyntheticError::TooManyActivations {
+            activations: 655_360_000_000,
+            limit: MAX_TOTAL_ACTIVATIONS,
+        }
+    );
+
+    assert_eq!(
+        generate(&SyntheticPattern::Random {
+            experts: 64,
+            active_per_event: 64,
+            events: 10_000_000,
+            seed: 0,
+        })
+        .unwrap_err(),
+        SyntheticError::TooManyActivations {
+            activations: 640_000_000,
+            limit: MAX_TOTAL_ACTIVATIONS,
+        }
+    );
+}

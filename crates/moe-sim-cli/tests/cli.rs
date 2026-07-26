@@ -1663,7 +1663,56 @@ fn trace_generate_rejects_identical_output_paths() {
     assert_eq!(stdout(&output), "");
     assert_eq!(
         stderr(&output),
-        "error: --out-trace and --out-model-manifest must name different paths\n"
+        "error: --out-trace and --out-model-manifest resolve to the same file; \
+         name two different destinations\n"
+    );
+    let workspace = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    assert!(
+        !workspace.join(&path).exists(),
+        "nothing may be written on a rejected collision"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_generate_rejects_outputs_aliased_through_a_symlinked_directory() {
+    // Two different spellings, one physical file: the second directory is a
+    // symlink to the first. Writing would let the manifest overwrite the
+    // trace while the report advertises two digests for one file.
+    let workspace = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let real_dir = workspace.join("target/test-generate/real-dir");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let link_dir = workspace.join("target/test-generate/link-dir");
+    match std::os::unix::fs::symlink(&real_dir, &link_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("cannot create the symlinked directory: {error}"),
+    }
+
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        "target/test-generate/real-dir/pair.jsonl",
+        "--out-model-manifest",
+        "target/test-generate/link-dir/pair.jsonl",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --out-trace and --out-model-manifest resolve to the same file; \
+         name two different destinations\n"
+    );
+    assert!(
+        !real_dir.join("pair.jsonl").exists(),
+        "nothing may be written on a rejected collision"
     );
 }
 

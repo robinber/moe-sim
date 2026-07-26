@@ -435,7 +435,11 @@ stochastic: its `--seed` is required, recorded in the report, and reproduces
 the trace byte for byte; the deterministic patterns reject a seed instead of
 silently ignoring it. The generator is a pure function in `moe-sim-core`
 spread by an in-repo `SplitMix64` mixer, so equal parameters produce equal
-files on every platform.
+files on every platform. Parameters are explicitly bounded — at most 65,536
+experts, 10 million events, and 50 million total activations — so an
+impossible request fails with a typed error before anything allocates, and
+output paths that resolve to the same physical file (including symlink and
+hard-link aliases) are rejected before anything is written.
 
 The following two commands reproduce a full synthetic comparison from a
 clean checkout (after `cargo build`):
