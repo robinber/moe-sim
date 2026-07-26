@@ -35,8 +35,9 @@ Before acting, inspect the workspace policy files that define the effective cont
 - `clippy.toml` — MSRV, doc-valid-idents, and threshold knobs.
 - `.cargo/config.toml` — canonical cargo aliases.
 - `deny.toml` — dependency advisory, license, and source policy.
-- `.github/workflows/ci.yml` — Rust CI gates when the workflow exists. This
-  repository has no CI workflow yet; do not infer or claim CI coverage.
+- `.github/workflows/ci.yml` — the CI lane: one job per reference quality
+  gate (fmt, clippy, test, doc, deny), with `--locked` builds, on pull
+  requests and pushes to `main`.
 
 Anchor on those files first, then before editing:
 
@@ -184,9 +185,9 @@ This keeps `Send` explicit at the boundary, avoids surprise auto-trait issues, a
 ## Documentation rules
 
 - Public items should have rustdoc. In libraries and shared crates, treat undocumented public API as a bug unless the repository has explicitly chosen a narrower documentation policy.
-- Repository policy requires `RUSTDOCFLAGS="-D warnings"`; future CI must
-  preserve it. Broken intra-doc links, bare URLs, and other rustdoc warnings
-  are build failures under the canonical documentation gate.
+- Repository policy requires `RUSTDOCFLAGS="-D warnings"`, and the CI `doc`
+  job enforces it. Broken intra-doc links, bare URLs, and other rustdoc
+  warnings are build failures under the canonical documentation gate.
 - Include examples when the example clarifies usage or edge cases.
 - Add `Errors`, `Panics`, and `Safety` sections when they are relevant.
 - Document invariants, preconditions, feature flags, and lifetimes when callers need them.
