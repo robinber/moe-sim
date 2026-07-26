@@ -819,6 +819,16 @@ mod tests {
         assert_eq!(trace_parse.exit_code(), 4);
         assert_eq!(manifest_parse.exit_code(), 4);
         assert_eq!(capacity.exit_code(), 5);
+
+        let synthetic = CliError::Synthetic {
+            message: "a synthetic pattern needs at least one expert".to_owned(),
+        };
+        let write = CliError::Write {
+            path: PathBuf::from("x"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        };
+        assert_eq!(synthetic.exit_code(), 2);
+        assert_eq!(write.exit_code(), 3);
     }
 
     #[test]

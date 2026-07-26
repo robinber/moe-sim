@@ -468,7 +468,7 @@ fn negative_budget_is_a_usage_error() {
     assert_eq!(stdout(&output), "");
 }
 
-// Read failures (exit 3).
+// File I/O failures (exit 3): reads here, writes in the generate section.
 
 #[test]
 fn trace_inspect_of_a_missing_file_exits_3() {
@@ -1439,6 +1439,7 @@ fn trace_generate_writes_the_pinned_cycle_pair_and_reports_its_digests() {
             "status: ok\n\
          tool_version: {}\n\
          input_format: v1\n\
+         source: synthetic\n\
          pattern: cyclic\n\
          experts: 3\n\
          events: 6\n\
@@ -1637,4 +1638,88 @@ fn compare_preserves_the_callers_policy_and_budget_order() {
     assert!(rows[1].starts_with("policy belady budget 4:"), "{report}");
     assert!(rows[2].starts_with("policy no-cache budget 6:"), "{report}");
     assert!(rows[3].starts_with("policy no-cache budget 4:"), "{report}");
+}
+
+#[test]
+fn trace_generate_rejects_identical_output_paths() {
+    // One file silently overwriting the other would report success while
+    // destroying the trace it just advertised.
+    let path = generated_path("aliased.json");
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        &path,
+        "--out-model-manifest",
+        &path,
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --out-trace and --out-model-manifest must name different paths\n"
+    );
+}
+
+#[test]
+fn a_failed_second_write_leaves_the_first_file_and_no_report() {
+    // The two writes are not atomic, and that is documented behavior: the
+    // trace lands, the manifest write fails, exit 3, and the report — the
+    // only success signal — is never printed.
+    let trace_path = generated_path("half-pair.jsonl");
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        &trace_path,
+        "--out-model-manifest",
+        "/nonexistent-moe-sim-dir/m.json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout(&output), "");
+    let on_disk = std::fs::read_to_string(
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(&trace_path),
+    )
+    .unwrap();
+    assert_eq!(on_disk.lines().count(), 6);
+}
+
+#[test]
+fn compare_requires_both_lists_explicitly() {
+    // The non-empty rule must hold even if the `required` derive attribute
+    // is dropped: omitting either list is a usage error, never an empty
+    // zero-row success report.
+    for missing in [
+        vec!["--policies", "lru"],
+        vec!["--global-budgets-bytes", "4"],
+    ] {
+        let mut args = vec![
+            "compare",
+            "--trace",
+            "fixtures/synthetic/three-experts-cycle.jsonl",
+            "--model-manifest",
+            "fixtures/models/three-experts-uniform.json",
+        ];
+        args.extend_from_slice(&missing);
+        let output = moe_sim(&args);
+        assert_eq!(output.status.code(), Some(2), "{missing:?}");
+        assert_eq!(stdout(&output), "", "{missing:?}");
+        assert!(
+            stderr(&output).contains("required"),
+            "{missing:?}: {}",
+            stderr(&output)
+        );
+    }
 }

@@ -15,6 +15,16 @@
 use crate::manifest::{ExpertKey, ExpertSizeEntry};
 use crate::trace::{Event, EventError, EventParts, Phase};
 
+/// Most experts one pattern may declare.
+///
+/// A declared bound, not a discovered one: it covers any realistic MoE
+/// layout while keeping generated manifests far from allocation failure,
+/// which would abort the process instead of returning a typed error.
+pub const MAX_EXPERTS: u32 = 65_536;
+
+/// Most events one pattern may generate in memory, for the same reason.
+pub const MAX_EVENTS: u64 = 10_000_000;
+
 /// One synthetic trace family and its parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntheticPattern {
@@ -37,7 +47,10 @@ pub enum SyntheticPattern {
         events: u64,
     },
     /// Each event activates `active_per_event` distinct experts drawn
-    /// uniformly by the seeded generator.
+    /// near-uniformly by the seeded generator: 64-bit draws reduced by
+    /// modulo, whose deviation from uniform is at most one part in `2^64`
+    /// per draw — documented rather than hidden, and kept so recorded seeds
+    /// stay stable.
     Random {
         /// Experts declared in the manifest.
         experts: u32,
@@ -69,9 +82,10 @@ pub enum SyntheticPattern {
         /// Events to generate.
         events: u64,
     },
-    /// One hot expert (id 0) revisited between the steps of a cold scan
-    /// over the remaining experts: recency keeps evicting what frequency
-    /// would keep.
+    /// Two accesses to the hot expert (id 0), then one scan over every cold
+    /// expert, repeated. A scan longer than the budget ages the hot expert
+    /// out of a recency cache, which reloads it every cycle, while a
+    /// frequency cache keeps it resident throughout.
     AdversarialLru {
         /// Experts declared in the manifest, at least 2.
         experts: u32,
@@ -86,6 +100,22 @@ pub enum SyntheticError {
     /// Every pattern needs at least one expert.
     #[error("a synthetic pattern needs at least one expert")]
     ZeroExperts,
+    /// The pattern declares more experts than the generator's bound.
+    #[error("a synthetic pattern is bounded to {limit} experts: got {experts}")]
+    TooManyExperts {
+        /// Requested expert count.
+        experts: u32,
+        /// The declared bound, [`MAX_EXPERTS`].
+        limit: u32,
+    },
+    /// The pattern asks for more events than the generator's bound.
+    #[error("a synthetic pattern is bounded to {limit} events: got {events}")]
+    TooManyEvents {
+        /// Requested event count.
+        events: u64,
+        /// The declared bound, [`MAX_EVENTS`].
+        limit: u64,
+    },
     /// The atomic set must have between 1 member and the expert count.
     #[error(
         "active_per_event must be between 1 and the expert count: got {active_per_event} of {experts}"
@@ -138,10 +168,11 @@ pub struct SyntheticCase {
 /// # Errors
 ///
 /// Returns the [`SyntheticError`] naming the impossible parameter: zero
-/// experts, an atomic set outside `1..=experts`, a hot window outside
-/// `1..=experts`, a zero shift period, or fewer than two experts for the
-/// adversarial scan.
+/// experts, counts beyond [`MAX_EXPERTS`] or [`MAX_EVENTS`], an atomic set
+/// outside `1..=experts`, a hot window outside `1..=experts`, a zero shift
+/// period, or fewer than two experts for the adversarial scan.
 pub fn generate(pattern: &SyntheticPattern) -> Result<SyntheticCase, SyntheticError> {
+    ensure_bounds(pattern)?;
     match *pattern {
         SyntheticPattern::Repetition {
             experts,
@@ -202,19 +233,26 @@ pub fn generate(pattern: &SyntheticPattern) -> Result<SyntheticCase, SyntheticEr
             if experts < 2 {
                 return Err(SyntheticError::AdversarialLruNeedsTwoExperts { experts });
             }
+            // One cycle is `0, 0, 1, 2, .., experts - 1`: the double hot
+            // access builds frequency, and the full cold scan ages the hot
+            // expert past any budget shorter than the scan.
+            let cycle = u64::from(experts) + 1;
+            let mut position = 0u64;
             let mut cold = 1u32;
             let mut out = Vec::new();
             for index in 0..events {
-                let expert = if index % 2 == 0 {
+                let expert = if position < 2 {
                     0
                 } else {
                     let picked = cold;
                     cold += 1;
-                    if cold == experts {
-                        cold = 1;
-                    }
                     picked
                 };
+                position += 1;
+                if position == cycle {
+                    position = 0;
+                    cold = 1;
+                }
                 out.push(event_at(index, vec![expert])?);
             }
             Ok(SyntheticCase {
@@ -223,6 +261,38 @@ pub fn generate(pattern: &SyntheticPattern) -> Result<SyntheticCase, SyntheticEr
             })
         }
     }
+}
+
+/// Rejects counts beyond the declared generator bounds before any
+/// allocation can act on them.
+fn ensure_bounds(pattern: &SyntheticPattern) -> Result<(), SyntheticError> {
+    let (experts, events) = match *pattern {
+        SyntheticPattern::Repetition {
+            experts, events, ..
+        }
+        | SyntheticPattern::Cyclic { experts, events }
+        | SyntheticPattern::Random {
+            experts, events, ..
+        }
+        | SyntheticPattern::HotsetShift {
+            experts, events, ..
+        }
+        | SyntheticPattern::VariableSizes { experts, events }
+        | SyntheticPattern::AdversarialLru { experts, events } => (experts, events),
+    };
+    if experts > MAX_EXPERTS {
+        return Err(SyntheticError::TooManyExperts {
+            experts,
+            limit: MAX_EXPERTS,
+        });
+    }
+    if events > MAX_EVENTS {
+        return Err(SyntheticError::TooManyEvents {
+            events,
+            limit: MAX_EVENTS,
+        });
+    }
+    Ok(())
 }
 
 /// Rejects a pattern over no experts.
@@ -257,8 +327,10 @@ fn event_at(index: u64, expert_ids: Vec<u32>) -> Result<Event, SyntheticError> {
     .map_err(|source| SyntheticError::Event { source })
 }
 
-/// Seeded uniform draws of `active_per_event` distinct experts per event,
-/// by partial Fisher-Yates over the expert pool.
+/// Seeded near-uniform draws of `active_per_event` distinct experts per
+/// event, by partial Fisher-Yates over the expert pool; distinctness holds
+/// by construction, and the only deviation from uniform is the modulo
+/// reduction in [`pool_slot`].
 fn random_events(
     experts: u32,
     active_per_event: u32,

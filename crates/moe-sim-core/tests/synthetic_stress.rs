@@ -2,14 +2,16 @@
 //!
 //! Everything is generated in memory: no large fixture enters the
 //! repository, and the same traces are regenerable from the CLI with
-//! `trace generate`. Gate coverage for slice 1D at scale: repeated
-//! generation and replay are identical, capacity and pinning invariants
-//! hold, and object and byte metrics stay separate.
+//! `trace generate`.
 //!
-//! Each pattern replays under one deliberately chosen policy instead of the
-//! full matrix: a full 100k matrix costs ~16 s in debug builds, and the
-//! policy × pattern combinations are already pinned at small scale by the
-//! unit tests and the exhaustive oracle.
+//! This is a runtime-bounded smoke check at scale, not a proof of the whole
+//! 1D gate and not a policy × pattern matrix (which costs ~16 s in debug
+//! builds). What it asserts directly: every pattern completes a 100k replay
+//! with `peak_resident_bytes` within its budget, the seeded pattern
+//! regenerates and replays identically, and the variable-size pattern keeps
+//! byte counters from collapsing into object counters. Policy semantics
+//! have their own focused replay tests, and generator sequences their own
+//! unit pins; neither is re-proven here.
 
 #![expect(
     unused_crate_dependencies,
@@ -48,7 +50,7 @@ fn every_pattern_holds_the_capacity_invariant_at_scale() {
     // One adversarially chosen policy per pattern: recency pressure for the
     // scans that defeat it, frequency pressure for the shifting hot set,
     // and the offline reference for the seeded random trace.
-    let cases: [(SyntheticPattern, Policy, u64); 6] = [
+    let cases: [(SyntheticPattern, Policy, u64); 7] = [
         (
             SyntheticPattern::Repetition {
                 experts: 8,
@@ -87,12 +89,24 @@ fn every_pattern_holds_the_capacity_invariant_at_scale() {
             16,
         ),
         (
+            // Scarcity: the cyclic scan thrashes, separating reload and
+            // eviction byte counters from their object counters.
             SyntheticPattern::VariableSizes {
                 experts: 64,
                 events: EVENTS,
             },
             Policy::Lru,
             256,
+        ),
+        (
+            // Full residency (sizes sum to 2080): hits exist, separating
+            // the hit byte counter too.
+            SyntheticPattern::VariableSizes {
+                experts: 64,
+                events: EVENTS,
+            },
+            Policy::Lru,
+            2080,
         ),
         (
             SyntheticPattern::AdversarialLru {
@@ -113,9 +127,23 @@ fn every_pattern_holds_the_capacity_invariant_at_scale() {
             metrics.peak_resident_bytes()
         );
         if matches!(pattern, SyntheticPattern::VariableSizes { .. }) {
-            // Linearly growing sizes: byte counters must not be a disguised
-            // copy of the object counters.
-            assert!(metrics.byte_loads() > metrics.object_loads(), "{pattern:?}");
+            // Linearly growing sizes: whenever an object counter is
+            // nonzero, its byte counterpart must exceed it — a disguised
+            // copy would tie. A zero object counter (LRU on the scarce
+            // cyclic scan never hits) must have a zero byte counterpart.
+            let pairs = [
+                (metrics.object_loads(), metrics.byte_loads(), "loads"),
+                (metrics.object_hits(), metrics.byte_hits(), "hits"),
+                (metrics.object_reloads(), metrics.byte_reloads(), "reloads"),
+                (metrics.evictions(), metrics.evicted_bytes(), "evictions"),
+            ];
+            for (objects, bytes, counter) in pairs {
+                if objects > 0 {
+                    assert!(bytes > objects, "{pattern:?} {policy} {counter}");
+                } else {
+                    assert_eq!(bytes, 0, "{pattern:?} {policy} {counter}");
+                }
+            }
         }
     }
 }

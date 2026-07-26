@@ -126,8 +126,11 @@ A run selects:
 - one model manifest;
 - one total memory budget;
 - one cache scope: global or per-layer;
-- one policy;
-- one deterministic seed where a policy needs randomness.
+- one policy.
+
+No shipped policy is stochastic, so runs take no seed. The only seed in the
+tool belongs to synthetic input generation (`trace generate --pattern
+random`) and is recorded in that command's report.
 
 Policy and scope are independent. A global cache may use the full budget. A
 per-layer cache requires an explicit quota for every simulated layer; quotas
@@ -450,6 +453,7 @@ moe-sim trace generate \
 status: ok
 tool_version: 0.1.0
 input_format: v1
+source: synthetic
 pattern: cyclic
 experts: 3
 events: 6

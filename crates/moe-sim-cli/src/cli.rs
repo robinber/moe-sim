@@ -258,13 +258,14 @@ pub enum PatternArg {
     Repetition,
     /// Single-expert events cycling round-robin over every expert.
     Cyclic,
-    /// Seeded uniform draws of distinct experts per event.
+    /// Seeded near-uniform draws of distinct experts per event.
     Random,
     /// A hot window of experts that shifts through the expert space.
     HotsetShift,
     /// The cyclic scan over experts of linearly growing size.
     VariableSizes,
-    /// One hot expert alternating with a cold scan.
+    /// A hammered hot expert aged out by full cold scans: worst for
+    /// recency, kind to frequency.
     AdversarialLru,
 }
 

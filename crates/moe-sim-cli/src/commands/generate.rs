@@ -1,10 +1,18 @@
 //! The `trace generate` command: deterministic synthetic traces and their
 //! twin manifests, written to disk with recorded provenance.
 //!
-//! The report echoes the pattern, every parameter it consumed — including
-//! the seed for the stochastic pattern — and the SHA-256 of each written
-//! file, so a generated input can be reproduced and audited exactly like a
+//! The report opens with a `source: synthetic` label — the strict v1 wire
+//! formats have no field for it, so a generated file is indistinguishable
+//! from a measured one on its own, and the report is where the label lives.
+//! It then echoes the pattern, every parameter it consumed — including the
+//! seed for the stochastic pattern — and the SHA-256 of each written file,
+//! so a generated input can be reproduced and audited exactly like a
 //! hand-written one.
+//!
+//! The two writes are not atomic: when the second write fails, the first
+//! file stays on disk and the report (the only success signal) is never
+//! printed. Identical output paths are rejected up front so one file cannot
+//! silently overwrite the other.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -20,6 +28,11 @@ use crate::trace_jsonl::encode_trace_jsonl;
 
 /// Executes `trace generate`: build the pattern, generate, encode, write.
 pub(super) fn run_generate(args: &TraceGenerateArgs) -> Result<String, CliError> {
+    if args.out_trace == args.out_model_manifest {
+        return Err(CliError::Usage {
+            message: "--out-trace and --out-model-manifest must name different paths".to_owned(),
+        });
+    }
     let pattern = synthetic_pattern(args).map_err(|message| CliError::Usage { message })?;
     let case = synthetic::generate(&pattern).map_err(|source| CliError::Synthetic {
         message: source.to_string(),
@@ -69,6 +82,7 @@ fn render_generate(
         "status: ok\n\
          tool_version: {}\n\
          input_format: {INPUT_FORMAT_VERSION}\n\
+         source: synthetic\n\
          pattern: {}\n\
          experts: {}\n\
          events: {events}\n",

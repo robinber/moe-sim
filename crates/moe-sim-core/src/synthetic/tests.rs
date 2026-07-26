@@ -93,13 +93,37 @@ fn variable_sizes_grow_linearly_over_a_cyclic_scan() {
 }
 
 #[test]
-fn adversarial_lru_alternates_the_hot_expert_with_a_cold_scan() {
+fn adversarial_lru_hammers_the_hot_expert_then_scans_every_cold_one() {
     let case = generate(&SyntheticPattern::AdversarialLru {
         experts: 4,
         events: 9,
     })
     .unwrap();
-    assert_eq!(expert_sequence(&case), [0, 1, 0, 2, 0, 3, 0, 1, 0]);
+    assert_eq!(expert_sequence(&case), [0, 0, 1, 2, 3, 0, 0, 1, 2]);
+}
+
+#[test]
+fn adversarial_lru_makes_recency_strictly_worse_than_frequency() {
+    // The named property, checked by replay rather than asserted in prose:
+    // with a two-object budget over [0,0,1,2,3] cycles, LRU ages the hot
+    // expert out during every scan and reloads it (9 loads), while LFU
+    // keeps it resident throughout (7 loads).
+    let case = generate(&SyntheticPattern::AdversarialLru {
+        experts: 4,
+        events: 12,
+    })
+    .unwrap();
+    let manifest =
+        crate::manifest::ModelManifest::try_from_entries(case.manifest_entries.iter().copied())
+            .unwrap();
+    let scope = crate::scope::CacheScope::Global { budget_bytes: 2 };
+    let lru =
+        crate::replay::replay(&manifest, &case.events, crate::replay::Policy::Lru, &scope).unwrap();
+    let lfu =
+        crate::replay::replay(&manifest, &case.events, crate::replay::Policy::Lfu, &scope).unwrap();
+    assert_eq!(lru.object_loads(), 9);
+    assert_eq!(lfu.object_loads(), 7);
+    assert!(lru.object_loads() > lfu.object_loads());
 }
 
 #[test]
@@ -238,6 +262,28 @@ fn impossible_parameters_are_rejected_with_the_named_error() {
         })
         .unwrap_err(),
         SyntheticError::AdversarialLruNeedsTwoExperts { experts: 1 }
+    );
+    assert_eq!(
+        generate(&SyntheticPattern::Cyclic {
+            experts: MAX_EXPERTS + 1,
+            events: 1,
+        })
+        .unwrap_err(),
+        SyntheticError::TooManyExperts {
+            experts: MAX_EXPERTS + 1,
+            limit: MAX_EXPERTS,
+        }
+    );
+    assert_eq!(
+        generate(&SyntheticPattern::Cyclic {
+            experts: 2,
+            events: MAX_EVENTS + 1,
+        })
+        .unwrap_err(),
+        SyntheticError::TooManyEvents {
+            events: MAX_EVENTS + 1,
+            limit: MAX_EVENTS,
+        }
     );
 }
 
