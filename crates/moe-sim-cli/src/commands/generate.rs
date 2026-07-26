@@ -16,6 +16,7 @@
 //! hard-linked — are rejected before anything is written, so one file
 //! cannot silently overwrite the other.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,14 +85,39 @@ fn ensure_distinct_destinations(out_trace: &Path, out_manifest: &Path) -> Result
 
 /// The physical file a write to `path` would land on.
 ///
-/// An existing path is canonicalized outright (following a symlinked final
-/// component too); otherwise the parent directory is canonicalized and the
-/// file name reattached, so a symlinked directory cannot alias two spelled
-/// paths onto one file.
+/// Existing targets and parent directories are canonicalized. When the final
+/// component is a symlink whose target does not exist yet, the link target is
+/// followed explicitly: canonicalization alone cannot reveal where the future
+/// write would land. Cycles stop at the first repeated path; an actual write
+/// through that cycle will fail rather than reach another output.
 fn physical_destination(path: &Path) -> PathBuf {
-    if let Ok(resolved) = path.canonicalize() {
-        return resolved;
+    let mut destination = path.to_path_buf();
+    let mut visited = HashSet::new();
+    loop {
+        if let Ok(resolved) = destination.canonicalize() {
+            return resolved;
+        }
+        destination = canonicalize_parent(&destination);
+        if !visited.insert(destination.clone()) {
+            return destination;
+        }
+        let Ok(target) = fs::read_link(&destination) else {
+            return destination;
+        };
+        destination = if target.is_absolute() {
+            target
+        } else {
+            destination
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
     }
+}
+
+/// Canonicalizes the parent of a pending destination while preserving its
+/// final file name.
+fn canonicalize_parent(path: &Path) -> PathBuf {
     let Some(file_name) = path.file_name() else {
         return path.to_path_buf();
     };
@@ -99,10 +125,9 @@ fn physical_destination(path: &Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    match parent.canonicalize() {
-        Ok(parent) => parent.join(file_name),
-        Err(_) => path.to_path_buf(),
-    }
+    parent
+        .canonicalize()
+        .map_or_else(|_| path.to_path_buf(), |parent| parent.join(file_name))
 }
 
 /// Whether both paths name one existing physical file (Unix: same device

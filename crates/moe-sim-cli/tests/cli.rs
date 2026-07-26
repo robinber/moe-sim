@@ -1716,6 +1716,53 @@ fn trace_generate_rejects_outputs_aliased_through_a_symlinked_directory() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn trace_generate_rejects_a_dangling_file_symlink_alias() {
+    // `canonicalize` cannot follow a final symlink while its target is still
+    // absent. The preflight must nevertheless see where the first write would
+    // land, or the manifest can overwrite the trace on the second path.
+    let workspace = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let case_dir = workspace.join("target/test-generate/dangling-file-link");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let alias = case_dir.join("alias.json");
+    let target = case_dir.join("shared.json");
+    for path in [&alias, &target] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot reset {}: {error}", path.display()),
+        }
+    }
+    std::os::unix::fs::symlink("shared.json", &alias).unwrap();
+
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        "target/test-generate/dangling-file-link/alias.json",
+        "--out-model-manifest",
+        "target/test-generate/dangling-file-link/shared.json",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --out-trace and --out-model-manifest resolve to the same file; \
+         name two different destinations\n"
+    );
+    assert!(
+        !target.exists(),
+        "nothing may be written through the dangling symlink"
+    );
+}
+
 #[test]
 fn a_failed_second_write_leaves_the_first_file_and_no_report() {
     // The two writes are not atomic, and that is documented behavior: the
