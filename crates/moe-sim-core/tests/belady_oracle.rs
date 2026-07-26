@@ -66,9 +66,10 @@ fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
 /// # Errors
 ///
 /// Refuses traces beyond the declared bounds, traces whose atomic active set
-/// cannot fit the budget at all, and traces whose exact byte total would
-/// overflow `u64` — an exact oracle must refuse what it cannot represent
-/// instead of relying on build-mode overflow behavior.
+/// cannot fit the budget at all, and traces whose **optimal** byte total
+/// would overflow `u64`. Costs accumulate in `u128` so a doomed branch that
+/// overflows `u64` simply loses to the minimum instead of aborting the
+/// oracle; only the final optimum must be representable.
 fn oracle_min_loaded_bytes(
     manifest: &ModelManifest,
     events: &[Event],
@@ -112,7 +113,7 @@ fn oracle_min_loaded_bytes(
     };
 
     let states = 1usize << keys.len();
-    let mut best: Vec<Option<u64>> = vec![None; states];
+    let mut best: Vec<Option<u128>> = vec![None; states];
     best[0] = Some(0);
     for event in events {
         let active_mask = event.expert_ids().iter().fold(0usize, |mask, &expert_id| {
@@ -122,17 +123,18 @@ fn oracle_min_loaded_bytes(
         if mask_bytes(active_mask).is_none_or(|active_bytes| active_bytes > budget_bytes) {
             return Err("an atomic active set exceeds the budget".to_owned());
         }
-        let mut next_best: Vec<Option<u64>> = vec![None; states];
+        let mut next_best: Vec<Option<u128>> = vec![None; states];
         for (resident_mask, &reachable) in best.iter().enumerate() {
             let Some(cost) = reachable else {
                 continue;
             };
             // The missing members are a subset of the checked active set, so
-            // their byte total cannot overflow.
+            // their byte total cannot overflow u64. The cumulative cost is
+            // u128 on purpose: at most 12 u64-sized loads stay far below
+            // u128::MAX, and a branch that outgrows u64 must lose to the
+            // minimum, not abort the whole oracle.
             let loaded = mask_bytes(active_mask & !resident_mask).unwrap();
-            let Some(cost) = cost.checked_add(loaded) else {
-                return Err("the oracle's byte total overflowed u64".to_owned());
-            };
+            let cost = cost + u128::from(loaded);
             let optional = resident_mask & !active_mask;
             let mut keep = optional;
             loop {
@@ -150,7 +152,12 @@ fn oracle_min_loaded_bytes(
         }
         best = next_best;
     }
-    Ok(best.iter().flatten().copied().min().unwrap_or(0))
+    let optimum = best.iter().flatten().copied().min().unwrap_or(0);
+    if let Ok(min_loaded_bytes) = u64::try_from(optimum) {
+        Ok(min_loaded_bytes)
+    } else {
+        Err("the oracle's byte total overflowed u64".to_owned())
+    }
 }
 
 #[test]
@@ -257,12 +264,33 @@ fn the_oracle_refuses_cases_beyond_its_declared_bounds() {
     let error = oracle_min_loaded_bytes(&pair, &infeasible, 1).unwrap_err();
     assert_eq!(error, "an atomic active set exceeds the budget");
 
-    // Each demand fits the budget on its own, but the exact total does not
-    // fit u64: the oracle refuses instead of wrapping or panicking.
+    // Each demand fits the budget on its own, but every schedule's total
+    // exceeds u64: the oracle refuses instead of wrapping or panicking.
     let huge = manifest_layers(&[(0, 0, u64::MAX - 1), (0, 1, u64::MAX - 1)]);
     let overflowing = vec![ev_on(0, vec![0]), ev_on(0, vec![1])];
     let error = oracle_min_loaded_bytes(&huge, &overflowing, u64::MAX).unwrap_err();
     assert_eq!(error, "the oracle's byte total overflowed u64");
+}
+
+#[test]
+fn the_oracle_ignores_unrepresentable_branches_when_the_optimum_fits() {
+    // The optimum keeps the huge expert resident, evicts a 50-byte expert
+    // at [2], and reloads it at the fourth event:
+    //   (M - 1000) + 50 + 50 + 50 = M - 850, representable in u64.
+    // The non-optimal branch evicts the huge expert at [2] and its
+    // cumulative cost overflows u64 when [0] reloads it. That doomed branch
+    // must lose to the minimum, not abort the oracle.
+    let m = u64::MAX;
+    let manifest = manifest_layers(&[(0, 0, m - 1000), (0, 1, 50), (0, 2, 50)]);
+    let events = vec![
+        ev_on(0, vec![0]),
+        ev_on(0, vec![1]),
+        ev_on(0, vec![2]),
+        ev_on(0, vec![1]),
+        ev_on(0, vec![0]),
+    ];
+    let optimum = oracle_min_loaded_bytes(&manifest, &events, m - 950).unwrap();
+    assert_eq!(optimum, m - 850);
 }
 
 #[test]
