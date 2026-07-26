@@ -4,7 +4,8 @@
 //! frozen process contract:
 //!
 //! - exit codes: 0 ok, 2 bad argv, 3 read/UTF-8/path, 4 parse/domain wire, 5
-//!   capacity rejection;
+//!   capacity rejection, 6 replay rejection (belady on a variable-size
+//!   manifest);
 //! - stdout carries only complete success reports; failures never emit partial
 //!   stdout;
 //! - stderr carries one `error:` line with the full typed error chain.
@@ -35,6 +36,10 @@ const TWO_LAYERS_TRACE_SHA256: &str =
     "35c61891c72dba7d6eeac758215f320afbef900e106646face1c58a3b268f824";
 const TWO_LAYERS_MANIFEST_SHA256: &str =
     "1c94b98f26c0f18f85a5aaca95b1a2d70ea8a1befeb55d8d8a893e792c0d7596";
+const THREE_EXPERTS_CYCLE_TRACE_SHA256: &str =
+    "8005f20747211b4fb2da49c5d68606f6229c940aa3f61a4f4828e5646b33eaaf";
+const THREE_EXPERTS_UNIFORM_MANIFEST_SHA256: &str =
+    "3b1a153a9c889a77c78229ff440ab8f071326f317eac6ace984454048f2694e5";
 
 /// Runs the `moe-sim` binary from the workspace root with `args`.
 fn moe_sim(args: &[&str]) -> Output {
@@ -392,14 +397,14 @@ fn run_with_an_unknown_policy_is_a_usage_error() {
         "--global-budget-bytes",
         "10",
         "--policy",
-        // Belongs to slice 1C and is not implemented: an unsupported policy
-        // must be refused, never silently approximated by another one.
-        "belady",
+        // Not a policy this tool declares: an unsupported policy must be
+        // refused, never silently approximated by another one.
+        "mru",
     ]);
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout(&output), "");
     assert!(
-        stderr(&output).contains("belady"),
+        stderr(&output).contains("mru"),
         "stderr must name the rejected policy, got: {}",
         stderr(&output)
     );
@@ -989,4 +994,142 @@ fn a_malformed_quota_pair_is_rejected_by_argument_parsing() {
         assert_eq!(output.status.code(), Some(2), "`{bad}` was accepted");
         assert_eq!(stdout(&output), "", "`{bad}` emitted a report");
     }
+}
+
+// Belady offline reference (slice 1C).
+
+#[test]
+fn run_belady_matches_the_hand_calculated_cycle_fixture() {
+    // fixtures/synthetic/three-experts-cycle.jsonl cycles [0],[1],[2] twice
+    // over three uniform 2-byte experts with room for two. Farthest-next-use
+    // loads 4 objects (LRU thrashes to 6), and the report labels the offline
+    // objective right after the policy.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/three-experts-cycle.jsonl",
+        "--model-manifest",
+        "fixtures/models/three-experts-uniform.json",
+        "--global-budget-bytes",
+        "4",
+        "--policy",
+        "belady",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
+         trace: fixtures/synthetic/three-experts-cycle.jsonl\n\
+         trace_sha256: {THREE_EXPERTS_CYCLE_TRACE_SHA256}\n\
+         model_manifest: fixtures/models/three-experts-uniform.json\n\
+         model_manifest_sha256: {THREE_EXPERTS_UNIFORM_MANIFEST_SHA256}\n\
+         global_budget_bytes: 4\n\
+         cache_scope: global\n\
+         policy: belady\n\
+         objective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)\n\
+         events: 6\n\
+         object_loads: 4\n\
+         byte_loads: 8\n\
+         object_hits: 2\n\
+         byte_hits: 4\n\
+         object_reloads: 1\n\
+         byte_reloads: 2\n\
+         evictions: 2\n\
+         evicted_bytes: 4\n\
+         peak_resident_bytes: 4\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn run_lru_thrashes_on_the_cycle_fixture() {
+    // The same cycle under LRU always evicts the expert needed next: every
+    // activation is a load, and no objective line appears because LRU is an
+    // online policy, not an offline reference.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/three-experts-cycle.jsonl",
+        "--model-manifest",
+        "fixtures/models/three-experts-uniform.json",
+        "--global-budget-bytes",
+        "4",
+        "--policy",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    assert!(!report.contains("objective:"), "report:\n{report}");
+    assert_eq!(field(report, "policy"), "lru");
+    assert_eq!(field(report, "object_loads"), "6");
+    assert_eq!(field(report, "byte_loads"), "12");
+    assert_eq!(field(report, "object_hits"), "0");
+    assert_eq!(field(report, "object_reloads"), "3");
+    assert_eq!(field(report, "evictions"), "4");
+    assert_eq!(field(report, "peak_resident_bytes"), "4");
+}
+
+#[test]
+fn run_belady_under_per_layer_quotas_reports_the_layer_line() {
+    // A single-layer quota equal to the global budget must reproduce the
+    // global belady metrics and append the layer's quota/peak pairing.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/three-experts-cycle.jsonl",
+        "--model-manifest",
+        "fixtures/models/three-experts-uniform.json",
+        "--global-budget-bytes",
+        "4",
+        "--cache-scope",
+        "per-layer",
+        "--layer-quota-bytes",
+        "0:4",
+        "--policy",
+        "belady",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    assert_eq!(field(report, "cache_scope"), "per-layer");
+    assert_eq!(
+        field(report, "objective"),
+        "minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)"
+    );
+    assert_eq!(field(report, "object_loads"), "4");
+    assert_eq!(field(report, "object_hits"), "2");
+    assert_eq!(field(report, "peak_resident_bytes"), "4");
+    assert!(
+        report.ends_with("layer 0: quota_bytes: 4, peak_resident_bytes: 4\n"),
+        "report:\n{report}"
+    );
+}
+
+#[test]
+fn run_belady_on_a_variable_size_manifest_exits_6() {
+    // Applicability is rejected at replay time with the two differing
+    // experts named, after the capacity pass accepted the configuration:
+    // exit 6, no partial stdout.
+    let output = moe_sim(&[
+        "run",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budget-bytes",
+        "15",
+        "--policy",
+        "belady",
+    ]);
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: replay failed: belady requires a uniform expert size: \
+         layer 0 expert 0 has 4 bytes, layer 0 expert 1 has 6 bytes\n"
+    );
 }

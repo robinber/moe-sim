@@ -50,6 +50,19 @@ pub enum Policy {
     /// belongs to a resident entry and restarts when an object is admitted
     /// again, so a once-hot object does not stay immortal after eviction.
     Lfu,
+    /// Evict the unpinned object whose next use lies farthest in the future.
+    ///
+    /// An offline reference, not an online policy: victim choice reads the
+    /// whole trace beyond the current event. Objects never activated again
+    /// are evicted first, and entries tied on next use lose by lowest expert
+    /// key.
+    ///
+    /// Only uniform-size manifests are accepted. Greedy farthest-next-use is
+    /// the classic MIN optimum for the uniform-size object-load objective
+    /// only, and atomic active sets fall outside the classic single-request
+    /// proof even there, so replay results are checked against a bounded
+    /// exhaustive oracle instead of being called optimal.
+    Belady,
 }
 
 impl fmt::Display for Policy {
@@ -58,6 +71,7 @@ impl fmt::Display for Policy {
             Self::NoCache => "no-cache",
             Self::Lru => "lru",
             Self::Lfu => "lfu",
+            Self::Belady => "belady",
         };
         f.write_str(name)
     }
@@ -202,6 +216,32 @@ pub enum ReplayError {
         /// Total capacity budget in bytes.
         total_budget_bytes: u64,
     },
+    /// The manifest declares more than one expert size under
+    /// [`Policy::Belady`].
+    ///
+    /// Belady's declared objective is the uniform-size object-load minimum.
+    /// General variable-size caching has no greedy farthest-next-use
+    /// optimum, so the combination is rejected before any event is replayed
+    /// instead of being approximated silently. The two named experts are the
+    /// manifest's first entry and the first entry whose size differs from
+    /// it, in ascending `(layer_id, expert_id)` order.
+    #[error(
+        "belady requires a uniform expert size: layer {first_layer_id} expert {first_expert_id} has {first_size_bytes} bytes, layer {second_layer_id} expert {second_expert_id} has {second_size_bytes} bytes"
+    )]
+    BeladyRequiresUniformSizes {
+        /// Layer of the manifest's first declared expert.
+        first_layer_id: u32,
+        /// Expert index of the manifest's first declared expert.
+        first_expert_id: u32,
+        /// Stored size of the manifest's first declared expert in bytes.
+        first_size_bytes: u64,
+        /// Layer of the first expert whose size differs.
+        second_layer_id: u32,
+        /// Expert index of the first expert whose size differs.
+        second_expert_id: u32,
+        /// Stored size of the first differing expert in bytes.
+        second_size_bytes: u64,
+    },
     /// A cumulative counter exceeded `u64`.
     ///
     /// Reported instead of wrapping silently: a wrapped metric is a wrong
@@ -343,13 +383,16 @@ impl ReplayMetrics {
 /// never evicts; the applicable capacity still bounds each individual active
 /// set.
 ///
-/// `events` is iterated once and is never collected internally. The item bound
-/// is `&Event`, so every event must outlive the call and the caller therefore
-/// supplies the whole trace: this signature does not on its own replay a trace
-/// larger than memory.
+/// `events` is collected before the first event is replayed:
+/// [`Policy::Belady`] chooses victims from the schedule beyond the current
+/// event, and the `&Event` item bound already makes the caller supply the
+/// whole trace. This function does not replay a trace larger than memory.
 ///
 /// # Errors
 ///
+/// Returns [`ReplayError::BeladyRequiresUniformSizes`] before any event is
+/// replayed when [`Policy::Belady`] is selected and the manifest declares
+/// more than one expert size.
 /// Returns [`ReplayError::LayerQuotaSumOverflow`] or
 /// [`ReplayError::LayerQuotaSumExceedsTotalBudget`] before any event is
 /// replayed when per-layer quotas break the `sum <= total budget` contract.
@@ -369,12 +412,20 @@ pub fn replay<'a>(
     policy: Policy,
     scope: &CacheScope,
 ) -> Result<ReplayMetrics, ReplayError> {
+    let events: Vec<&'a Event> = events.into_iter().collect();
+    let next_uses = if policy == Policy::Belady {
+        ensure_uniform_expert_size(manifest)?;
+        Some(next_use_schedule(&events))
+    } else {
+        None
+    };
+
     let mut metrics = ReplayMetrics::default();
     let mut caches = ScopedCaches::new(scope)?;
     let mut ever_loaded: BTreeSet<ExpertKey> = BTreeSet::new();
     let mut peak_total_bytes: u64 = 0;
 
-    for (event_index, event) in events.into_iter().enumerate() {
+    for (event_index, &event) in events.iter().enumerate() {
         let layer_id = event.layer_id();
         let request_id = event.request_id();
         let active_set_bytes =
@@ -458,6 +509,10 @@ pub fn replay<'a>(
         admit_missing(cache, &mut metrics, &mut ever_loaded, &missing, event_index)?;
 
         cache.record_access(&pinned);
+
+        if let Some(schedule) = &next_uses {
+            record_event_next_uses(cache, event, &schedule[event_index]);
+        }
 
         // Sampled after this event's admissions and before any no-cache
         // release: only this event's layer changed, and its residency peaks
@@ -646,12 +701,80 @@ fn admit_missing(
     Ok(())
 }
 
+/// Rejects manifests that declare more than one expert size.
+///
+/// [`Policy::Belady`]'s applicability gate: its declared objective is the
+/// uniform-size object-load minimum, so a variable-size manifest must fail
+/// before any event is replayed.
+fn ensure_uniform_expert_size(manifest: &ModelManifest) -> Result<(), ReplayError> {
+    let mut entries = manifest.entries();
+    let Some(first) = entries.next() else {
+        return Ok(());
+    };
+    for entry in entries {
+        if entry.size_bytes != first.size_bytes {
+            return Err(ReplayError::BeladyRequiresUniformSizes {
+                first_layer_id: first.key.layer_id(),
+                first_expert_id: first.key.expert_id(),
+                first_size_bytes: first.size_bytes,
+                second_layer_id: entry.key.layer_id(),
+                second_expert_id: entry.key.expert_id(),
+                second_size_bytes: entry.size_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// For each event, each active-set member's next activation, aligned with
+/// the event's `expert_ids` order. `None` marks a member never activated
+/// again.
+///
+/// Keys carry their layer, so under a per-layer scope each cache still sees
+/// exactly the schedule of its own layer.
+fn next_use_schedule(events: &[&Event]) -> Vec<Vec<Option<usize>>> {
+    let mut next_activation: BTreeMap<ExpertKey, usize> = BTreeMap::new();
+    let mut schedule = vec![Vec::new(); events.len()];
+    for (event_index, event) in events.iter().enumerate().rev() {
+        let member_next_uses = &mut schedule[event_index];
+        for &expert_id in event.expert_ids() {
+            let key = ExpertKey::new(event.layer_id(), expert_id);
+            // Walking backwards, the previously stored index is exactly the
+            // next activation after this event.
+            member_next_uses.push(next_activation.insert(key, event_index));
+        }
+    }
+    schedule
+}
+
+/// Applies one event's slice of the schedule to its resident members.
+///
+/// Every member is resident when this runs, so each entry learns when its
+/// next activation comes; eviction candidates always carry a schedule
+/// because members stay pinned until their event has recorded it.
+fn record_event_next_uses(
+    cache: &mut ResidentCache,
+    event: &Event,
+    member_next_uses: &[Option<usize>],
+) {
+    for (&expert_id, &next_use_event) in event.expert_ids().iter().zip(member_next_uses) {
+        cache.record_next_use(ExpertKey::new(event.layer_id(), expert_id), next_use_event);
+    }
+}
+
+/// Ranks a next use so later activations rank higher and "never activated
+/// again" ranks highest of all.
+fn next_use_rank(next_use_event: Option<usize>) -> (bool, usize) {
+    next_use_event.map_or((true, 0), |event_index| (false, event_index))
+}
+
 /// One resident expert object and the ordering metadata its policy needs.
 #[derive(Debug, Clone, Copy)]
 struct ResidentEntry {
     size_bytes: u64,
     frequency: u64,
     last_used_tick: u64,
+    next_use_event: Option<usize>,
 }
 
 /// Byte-bounded set of resident expert objects.
@@ -703,6 +826,7 @@ impl ResidentCache {
                 size_bytes,
                 frequency: 0,
                 last_used_tick: self.tick,
+                next_use_event: None,
             },
         );
         self.resident_bytes = self.resident_bytes.saturating_add(size_bytes);
@@ -729,6 +853,14 @@ impl ResidentCache {
         }
     }
 
+    /// Records one member's next activation so Belady's victim choice sees
+    /// the declared schedule; `None` marks a member never activated again.
+    fn record_next_use(&mut self, key: ExpertKey, next_use_event: Option<usize>) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.next_use_event = next_use_event;
+        }
+    }
+
     /// Evicts one unpinned object chosen by `policy`, returning its size.
     ///
     /// Entries tied on every policy criterion lose by lowest expert key.
@@ -746,6 +878,11 @@ impl ResidentCache {
                         .cmp(&right.frequency)
                         .then(left.last_used_tick.cmp(&right.last_used_tick)),
                     Policy::Lru | Policy::NoCache => left.last_used_tick.cmp(&right.last_used_tick),
+                    // Reversed on purpose: the entry whose next use is
+                    // farthest away (or never comes) must sort first.
+                    Policy::Belady => {
+                        next_use_rank(right.next_use_event).cmp(&next_use_rank(left.next_use_event))
+                    }
                 };
                 // Members of one atomic set share one access timestamp, so a
                 // genuine tie is possible and must be broken explicitly.
@@ -780,5 +917,7 @@ fn bump(
         })
 }
 
+#[cfg(test)]
+mod belady_tests;
 #[cfg(test)]
 mod tests;

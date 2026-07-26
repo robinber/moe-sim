@@ -8,7 +8,7 @@ use crate::manifest::ExpertSizeEntry;
 use crate::trace::{EventParts, Phase};
 
 /// Global-scope shorthand: every pre-quota test replays under one budget.
-fn replay_global<'a>(
+pub(super) fn replay_global<'a>(
     manifest: &ModelManifest,
     events: impl IntoIterator<Item = &'a Event>,
     policy: Policy,
@@ -23,7 +23,7 @@ fn replay_global<'a>(
 }
 
 /// Builds a single-layer manifest from `(expert_id, size_bytes)` pairs.
-fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
+pub(super) fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
     ModelManifest::try_from_entries(experts.iter().map(|&(expert_id, size_bytes)| {
         ExpertSizeEntry {
             key: ExpertKey::new(0, expert_id),
@@ -34,7 +34,7 @@ fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
 }
 
 /// One layer-0 event activating `expert_ids` as an atomic set.
-fn ev(expert_ids: Vec<u32>) -> Event {
+pub(super) fn ev(expert_ids: Vec<u32>) -> Event {
     Event::new(EventParts {
         request_id: 1,
         phase: Phase::Decode,
@@ -668,7 +668,7 @@ fn replay_accepts_a_streaming_iterator() {
 // --- per-layer quotas ---
 
 /// Builds a manifest from `(layer_id, expert_id, size_bytes)` triples.
-fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
+pub(super) fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
     ModelManifest::try_from_entries(experts.iter().map(|&(layer_id, expert_id, size_bytes)| {
         ExpertSizeEntry {
             key: ExpertKey::new(layer_id, expert_id),
@@ -679,7 +679,7 @@ fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
 }
 
 /// One event on `layer_id` activating `expert_ids` as an atomic set.
-fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
+pub(super) fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
     Event::new(EventParts {
         request_id: 1,
         phase: Phase::Decode,
@@ -691,7 +691,7 @@ fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
     .unwrap()
 }
 
-fn per_layer(total_budget_bytes: u64, quotas: &[(u32, u64)]) -> CacheScope {
+pub(super) fn per_layer(total_budget_bytes: u64, quotas: &[(u32, u64)]) -> CacheScope {
     CacheScope::PerLayer {
         total_budget_bytes,
         layer_quota_bytes: quotas.iter().copied().collect(),
