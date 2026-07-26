@@ -18,8 +18,10 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 
 **Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
 (atomic-set validation), an explicit expert-size `ModelManifest`, and
-deterministic replay with byte-accurate accounting under no-cache, LRU, and
-LFU — within one global budget or under explicit fixed per-layer quotas. The
+deterministic replay with byte-accurate accounting under no-cache, LRU, LFU,
+and an offline Belady reference whose results the test suite checks against a
+bounded exhaustive oracle on enumerated tiny cases — within one global budget
+or under explicit fixed per-layer quotas. The
 intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
 byte budgets. Everything beyond that is optional curiosity, not a tunnel to
 finish.
@@ -366,10 +368,59 @@ expert does not become immortal after eviction. One atomic active set counts
 as one access, so members of the same event can tie on every criterion; a
 genuine tie evicts the lowest expert key first, as an explicit rule.
 
+`--policy belady` is an offline reference, not an online policy: it evicts the
+expert whose next use is farthest away — never-reused experts first, ties by
+lowest expert key — which requires reading the whole trace beyond the current
+event. It only accepts manifests whose experts all share one size, and its
+report carries an `objective:` line so the numbers never pose as an online
+policy's outcome. The committed cycle fixture repeats `[0], [1], [2]` twice
+over three 2-byte experts with room for two: LRU always evicts the expert
+needed next and loads 6 objects, while the offline reference loads 4:
+
+```bash
+moe-sim run \
+  --trace fixtures/synthetic/three-experts-cycle.jsonl \
+  --model-manifest fixtures/models/three-experts-uniform.json \
+  --global-budget-bytes 4 \
+  --policy belady
+```
+
+```text
+status: ok
+tool_version: 0.1.0
+input_format: v1
+trace: fixtures/synthetic/three-experts-cycle.jsonl
+trace_sha256: 8005f20747211b4fb2da49c5d68606f6229c940aa3f61a4f4828e5646b33eaaf
+model_manifest: fixtures/models/three-experts-uniform.json
+model_manifest_sha256: 3b1a153a9c889a77c78229ff440ab8f071326f317eac6ace984454048f2694e5
+global_budget_bytes: 4
+cache_scope: global
+policy: belady
+objective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)
+events: 6
+object_loads: 4
+byte_loads: 8
+object_hits: 2
+byte_hits: 4
+object_reloads: 1
+byte_reloads: 2
+evictions: 2
+evicted_bytes: 4
+peak_resident_bytes: 4
+```
+
+Classic Belady MIN is proven optimal for single-object requests of uniform
+size. Atomic active sets fall outside that classic model, so `moe-sim` does
+not call this policy optimal by proof: it is checked against a deliberately
+bounded exhaustive oracle (at most 12 events and 8 distinct experts) that
+explores every eviction schedule, and greedy farthest-next-use matches the
+oracle's optimum on every enumerated uniform-size case. A manifest with more
+than one expert size is rejected with exit code 6 rather than approximated,
+because general variable-size caching has no greedy byte-aware optimum.
+
 ### Planned commands
 
-`compare` belongs to Milestone 1 and is not available yet. Offline reference
-policies arrive with slice 1C:
+`compare` belongs to Milestone 1 and is not available yet:
 
 ```bash
 moe-sim compare \
@@ -425,13 +476,18 @@ the storage-simulation milestone establishes a real need.
 
 ## Offline baselines
 
-Classic Belady MIN is optimal for uniform-size pages. Once expert objects have
+Classic Belady MIN is proven optimal for single-object requests of uniform
+size; atomic active sets fall outside that proof, which is why the belady
+section above claims oracle-checked equality on enumerated cases rather than
+optimality. Once expert objects have
 different sizes or fetch costs, the general offline caching problem is
 NP-hard. `moe-sim` will therefore not describe a scalable greedy
 "byte-aware Belady" implementation as an optimum.
 
-`v0.1` will use classic Belady on uniform-size fixtures and a deliberately
-bounded exhaustive solver for tiny variable-size correctness tests. Practical
+`v0.1` uses classic Belady on uniform-size fixtures and a deliberately
+bounded exhaustive solver for tiny variable-size correctness tests, both
+landed with slice 1C — Belady on the CLI, the solver as a test-only gate.
+Practical
 bounds for large variable-size traces are a separate research feature. See
 [Practical Bounds on Optimal Caching with Variable Object Sizes](https://arxiv.org/abs/1711.03709)
 and [General Caching Is Hard: Even with Small Pages](https://arxiv.org/abs/1506.07905).

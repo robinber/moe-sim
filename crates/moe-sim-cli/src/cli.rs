@@ -64,6 +64,10 @@ pub enum PolicyArg {
     /// Evict the least frequently used unpinned expert, breaking ties by
     /// least recent use, then by lowest expert key.
     Lfu,
+    /// Offline reference: evict the unpinned expert whose next use is
+    /// farthest away, never-reused first, breaking ties by lowest expert
+    /// key. Requires a uniform-size manifest and reads the whole trace.
+    Belady,
 }
 
 impl From<PolicyArg> for Policy {
@@ -72,6 +76,7 @@ impl From<PolicyArg> for Policy {
             PolicyArg::NoCache => Self::NoCache,
             PolicyArg::Lru => Self::Lru,
             PolicyArg::Lfu => Self::Lfu,
+            PolicyArg::Belady => Self::Belady,
         }
     }
 }

@@ -162,9 +162,9 @@ fixtures.
 
 ### Slice 1C — Offline correctness references
 
-- [ ] Classic Belady MIN for uniform-size traces.
-- [ ] Bounded exhaustive oracle for tiny variable-size cases only.
-- [ ] Label every offline result with objective and applicability.
+- [x] Classic Belady MIN for uniform-size traces.
+- [x] Bounded exhaustive oracle for tiny variable-size cases only.
+- [x] Label every offline result with objective and applicability.
 
 **Gate:** Belady matches exhaustive uniform-size cases; the bounded solver
 checks tiny variable-size optima. Do **not** brand a scalable greedy
@@ -331,9 +331,12 @@ session is forced to advance a milestone counter.
 
 ## Next planning target
 
-**Current focus:** Milestone 0 is closed; slices 1A and 1B have shipped —
-no-cache, LRU, and LFU under one global budget or explicit per-layer quotas.
-Open slice 1C only if an offline reference is still interesting.
+**Current focus:** Milestone 0 is closed; slices 1A, 1B, and 1C have shipped —
+no-cache, LRU, LFU, and an offline Belady reference (checked in the test
+suite against a bounded exhaustive oracle) under one global budget or
+explicit per-layer quotas. Slice 1D (`compare` and outputs)
+is the last slice before the `v0.1` exit criteria; open it only if the
+comparison surface is still interesting.
 
 After any closed slice, the default next action is:
 

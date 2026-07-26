@@ -8,7 +8,7 @@ use crate::manifest::ExpertSizeEntry;
 use crate::trace::{EventParts, Phase};
 
 /// Global-scope shorthand: every pre-quota test replays under one budget.
-fn replay_global<'a>(
+pub(super) fn replay_global<'a>(
     manifest: &ModelManifest,
     events: impl IntoIterator<Item = &'a Event>,
     policy: Policy,
@@ -23,7 +23,7 @@ fn replay_global<'a>(
 }
 
 /// Builds a single-layer manifest from `(expert_id, size_bytes)` pairs.
-fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
+pub(super) fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
     ModelManifest::try_from_entries(experts.iter().map(|&(expert_id, size_bytes)| {
         ExpertSizeEntry {
             key: ExpertKey::new(0, expert_id),
@@ -34,7 +34,7 @@ fn manifest_of(experts: &[(u32, u64)]) -> ModelManifest {
 }
 
 /// One layer-0 event activating `expert_ids` as an atomic set.
-fn ev(expert_ids: Vec<u32>) -> Event {
+pub(super) fn ev(expert_ids: Vec<u32>) -> Event {
     Event::new(EventParts {
         request_id: 1,
         phase: Phase::Decode,
@@ -668,7 +668,7 @@ fn replay_accepts_a_streaming_iterator() {
 // --- per-layer quotas ---
 
 /// Builds a manifest from `(layer_id, expert_id, size_bytes)` triples.
-fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
+pub(super) fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
     ModelManifest::try_from_entries(experts.iter().map(|&(layer_id, expert_id, size_bytes)| {
         ExpertSizeEntry {
             key: ExpertKey::new(layer_id, expert_id),
@@ -679,7 +679,7 @@ fn manifest_layers(experts: &[(u32, u32, u64)]) -> ModelManifest {
 }
 
 /// One event on `layer_id` activating `expert_ids` as an atomic set.
-fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
+pub(super) fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
     Event::new(EventParts {
         request_id: 1,
         phase: Phase::Decode,
@@ -691,7 +691,7 @@ fn ev_on(layer_id: u32, expert_ids: Vec<u32>) -> Event {
     .unwrap()
 }
 
-fn per_layer(total_budget_bytes: u64, quotas: &[(u32, u64)]) -> CacheScope {
+pub(super) fn per_layer(total_budget_bytes: u64, quotas: &[(u32, u64)]) -> CacheScope {
     CacheScope::PerLayer {
         total_budget_bytes,
         layer_quota_bytes: quotas.iter().copied().collect(),
@@ -971,4 +971,22 @@ fn unactivated_quota_layers_report_a_zero_peak() {
         metrics.layer_peak_resident_bytes(),
         &[(0u32, 5u64), (1u32, 0u64)].into_iter().collect()
     );
+}
+
+#[test]
+fn online_policies_stream_events_and_stop_at_the_first_error() {
+    // The tail iterator panics if polled: an online policy must return the
+    // first event's typed error without materializing the rest of the trace.
+    let manifest = manifest_of(&[(0, 4)]);
+    let bad = ev(vec![9]);
+    for policy in [Policy::NoCache, Policy::Lru, Policy::Lfu] {
+        let events = std::iter::once(&bad).chain(std::iter::from_fn(|| -> Option<&Event> {
+            panic!("the tail of the trace must not be polled after an error")
+        }));
+        let error = replay_global(&manifest, events, policy, 4).unwrap_err();
+        assert!(
+            matches!(error, ReplayError::ActiveSetBytes { event_index: 0, .. }),
+            "unexpected error for {policy}: {error}"
+        );
+    }
 }

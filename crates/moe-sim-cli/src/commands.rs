@@ -83,10 +83,10 @@ pub enum CliError {
     /// Replay failed after the configuration was accepted. Exit code 6.
     ///
     /// `run` validates capacity before replaying, and that pass already
-    /// rejects unknown experts and per-event byte overflow, so this variant is
-    /// not reachable through the current command flow. It exists because
-    /// replay returns a fallible result that must not be discarded, and a
-    /// cumulative counter overflow has no earlier gate.
+    /// rejects unknown experts and per-event byte overflow. This variant is
+    /// still reachable: `belady` rejects a manifest without one uniform
+    /// expert size at replay time, and a cumulative counter overflow has no
+    /// earlier gate.
     #[error("replay failed: {source}")]
     Replay {
         /// Underlying replay error.
@@ -370,7 +370,10 @@ fn render_capacity_check(
 ///
 /// The policy and scope names come from the domain types' `Display`, not from
 /// `clap`, so the report contract cannot shift with an argument-parsing
-/// detail. Under a per-layer scope the aggregate metrics are followed by one
+/// detail. A `belady` run adds an `objective:` line right after the policy,
+/// so every offline result names its objective and applicability instead of
+/// posing as an online policy's outcome. Under a per-layer scope the
+/// aggregate metrics are followed by one
 /// line per quota'd layer pairing the quota with that cache's high-water
 /// mark, so the per-layer capacity invariant is auditable from the report
 /// itself.
@@ -382,6 +385,12 @@ fn render_run(
     manifest_digest: &str,
     metrics: &ReplayMetrics,
 ) -> String {
+    let objective_line = match policy {
+        Policy::Belady => {
+            "objective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)\n"
+        }
+        Policy::NoCache | Policy::Lru | Policy::Lfu => "",
+    };
     let mut report = format!(
         "status: ok\n\
          tool_version: {}\n\
@@ -393,7 +402,7 @@ fn render_run(
          global_budget_bytes: {}\n\
          cache_scope: {scope}\n\
          policy: {policy}\n\
-         events: {}\n\
+         {objective_line}events: {}\n\
          object_loads: {}\n\
          byte_loads: {}\n\
          object_hits: {}\n\
@@ -695,6 +704,7 @@ mod tests {
             (Policy::NoCache, "no-cache"),
             (Policy::Lru, "lru"),
             (Policy::Lfu, "lfu"),
+            (Policy::Belady, "belady"),
         ] {
             let args = RunArgs {
                 trace: PathBuf::from("t.jsonl"),
@@ -716,6 +726,19 @@ mod tests {
                 rendered.contains(&format!("policy: {expected}\n")),
                 "{policy} rendered as: {rendered}"
             );
+            // The objective label belongs to the offline reference alone,
+            // and sits between the policy line and the metrics.
+            if policy == Policy::Belady {
+                assert!(
+                    rendered.contains("policy: belady\nobjective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)\nevents:"),
+                    "belady rendered as: {rendered}"
+                );
+            } else {
+                assert!(
+                    !rendered.contains("objective:"),
+                    "{policy} rendered as: {rendered}"
+                );
+            }
         }
     }
 
