@@ -1,5 +1,9 @@
 # moe-sim roadmap
 
+**Final status:** `v0.1` is complete and the project is parked at its intended
+useful stopping point. This roadmap is retained as a record and an idea archive;
+there is no active next milestone.
+
 ## Project stance (read this first)
 
 `moe-sim` is an **exploratory** project. It exists to learn, poke at ideas, and
@@ -19,18 +23,19 @@ not a tunnel you are expected to walk end-to-end.
 | **Narrow over complete** | Prefer one reproducible comparison to a broad unfinished simulator. |
 
 If energy or interest drops, **ship or stop at the last closed milestone** and
-leave the rest in this backlog. Do not expand scope to “finish the roadmap.”
+leave the rest in this idea archive. Do not expand scope to “finish the
+roadmap.”
 
 ---
 
 ## Intended path (default)
 
 ```text
-M0  contracts & workspace     ← in progress / near
+M0  contracts & workspace     ← complete
         ↓
-M1  logical cache sim (v0.1)  ← primary useful stop
+M1  logical cache sim (v0.1)  ← complete
         ↓
-    [optional] explore further, park the repo, or move on
+    project parked            ← final decision
 ```
 
 **Primary goal:** a small deterministic logical simulator on synthetic traces
@@ -55,17 +60,16 @@ Keep these even in exploratory mode — they protect honesty, not process theate
 - Do not publish latency claims without a measured, documented basis.
 
 Heavy preregistration protocols, multi-device calibration gates, and
-publication-grade statistical procedures are **only** relevant if you later
-choose a research-shaped exploration — they are not required for exploratory
-engineering toward `v0.1`.
+publication-grade statistical procedures are **only** relevant if a separate
+research-shaped exploration is ever opened; they were not required to complete
+`v0.1`.
 
 ---
 
 ## Milestone 0 — Repository and contracts
 
-**Status:** exploratory foundation.  
-**Outcome:** a small Rust workspace with stable initial contracts and **no**
-simulation claims yet.
+**Status:** complete.
+**Outcome:** a small Rust workspace with stable initial contracts.
 
 ### Deliverables
 
@@ -114,7 +118,7 @@ only if you still want a runnable policy comparison.
 
 ## Milestone 1 — Deterministic logical cache simulator (`v0.1`)
 
-**Status:** **default exploratory target** — the intended “ship and maybe stop.”  
+**Status:** complete — the intended useful stopping point was taken.
 **Outcome:** reproducible methodology infrastructure on **synthetic** traces:
 canonical events, deterministic replay, byte budgets, and fair policy
 comparison.
@@ -205,9 +209,9 @@ done for personal exploration.
 
 ### Stop / continue after `v0.1`
 
-**This is the recommended default stopping point.**
+**Decision: park the project at this stopping point.**
 
-You may:
+The alternatives below are retained as historical guidance, not active work:
 
 - park the repo and move on;
 - add one more policy or metric as a side quest;
@@ -219,8 +223,8 @@ You should **not** treat M2–M7 as “what’s left to finish.”
 
 ## Optional explorations (not a sequence)
 
-Everything below is a **backlog of directions**, not a pipeline. Pick zero or
-one when interest is genuine. Reorder freely. Drop freely.
+Everything below is a **parked idea archive**, not a pipeline or remaining
+backlog. Reopening one item would require a new bounded project decision.
 
 Each item should earn its keep with a one-line question, e.g.  
 *“Does this teach me something I cannot learn cheaper another way?”*
@@ -243,6 +247,8 @@ is painful relative to learning value.
 **Question:** how much do file layout and alignment amplify logical misses?
 
 - Offsets, alignment, packing → physical read schedules (bytes, not latency).
+- Separate checkpoint-read bytes from resident-cache bytes when precision or
+  representation differs.
 - Attribute amplification categories explicitly.
 - No timing claims.
 
@@ -329,25 +335,15 @@ session is forced to advance a milestone counter.
 
 ---
 
-## Next planning target
+## Final project decision
 
-**Current focus:** Milestone 0 is closed and every Milestone 1 slice
-(1A–1D) has shipped: no-cache, LRU, LFU, and the oracle-checked offline
-Belady reference replay under one global budget or explicit per-layer
-quotas, and the CLI generates deterministic synthetic traces and compares
-policies across budget sweeps in text, JSON, and CSV. The `v0.1` exit
-criteria are met by the shipped surface; declaring `v0.1` — and whether to
-stop there, which this roadmap recommends as the default — is the
-operator's decision, not an implementation task.
+Milestone 0 and every Milestone 1 slice (1A–1D) are complete: no-cache, LRU,
+LFU, and the oracle-checked offline Belady reference replay under one global
+budget or explicit per-layer quotas, and the CLI generates deterministic
+synthetic traces and compares policies across budget sweeps in text, JSON, and
+CSV.
 
-After any closed slice, the default next action is:
-
-```text
-decide: continue | side quest | pause
-```
-
-not
-
-```text
-automatically start the next milestone
-```
+The `v0.1` exit criteria are met and the operator chose to stop at the
+recommended boundary. There is no next planning target. Any future work starts
+with a new question and a new explicit scope; it is not completion debt for
+`moe-sim`.
