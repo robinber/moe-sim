@@ -9,24 +9,23 @@ The project answers a deliberately narrow question:
 > how do different caching policies affect misses, bytes loaded, and cache
 > churn?
 
-The default path answers this question with a **deterministic logical**
+The shipped project answers this question with a **deterministic logical**
 simulator on synthetic traces. Storage timing, prefetching, compute overlap,
-and physical replay are **optional later experiments**, not part of the
-required journey — see [ROADMAP.md](ROADMAP.md).
+and physical replay remain outside the completed scope — see
+[ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-**Exploratory / pre-`v0.1`.** `moe-sim-core` has canonical activation events
-(atomic-set validation), an explicit expert-size `ModelManifest`, and
+**`v0.1` complete; project parked.** `moe-sim-core` has canonical activation
+events (atomic-set validation), an explicit expert-size `ModelManifest`, and
 deterministic replay with byte-accurate accounting under no-cache, LRU, LFU,
 and an offline Belady reference whose results the test suite checks against a
 bounded exhaustive oracle on enumerated tiny cases — within one global budget
 or under explicit fixed per-layer quotas. The CLI generates deterministic
-synthetic traces (`trace generate`) and compares policies across budget
-sweeps (`compare`) in text, JSON, and CSV. Every Milestone 1 slice (1A–1D)
-has shipped; declaring `v0.1` — the intended useful stop: logical cache
-comparison under byte budgets — is the operator's next decision. Everything
-beyond that is optional curiosity, not a tunnel to finish.
+synthetic traces (`trace generate`) and compares policies across budget sweeps
+(`compare`) in text, JSON, and CSV. Every Milestone 1 slice (1A–1D) and the
+documented `v0.1` exit criteria are complete. No later milestone is scheduled;
+the optional roadmap remains an idea archive, not unfinished work.
 
 ## Why this project
 
@@ -39,13 +38,12 @@ of bringing missing experts into memory.
 accounting, same objectives — so policy ideas can be compared honestly without
 standing up an inference runtime.
 
-The project is not an inference engine, not a multi-year research program, and
-not obligated to reach a “complete” simulator. Stopping after a clean `v0.1`
-is a successful outcome.
+The project is not an inference engine or a multi-year research program. It
+reached its deliberately narrow useful stop at `v0.1` and is now parked.
 
-## Feasible first release
+## Completed `v0.1` scope
 
-The first useful release (`v0.1`) is limited to:
+The completed `v0.1` scope is limited to:
 
 - a canonical activation-event format;
 - deterministic synthetic traces;
@@ -58,9 +56,8 @@ The first useful release (`v0.1`) is limited to:
 - single-run and policy-comparison commands;
 - human-readable, JSON, and CSV reports.
 
-A real dataset adapter (`v0.2`-shaped work) is an **optional** exploration after
-`v0.1`, only if synthetic results still leave an interesting question. It is
-not on the critical path.
+A real dataset adapter remains a parked, optional idea. It is not shipped or
+scheduled.
 
 ## Non-goals (default path)
 
@@ -110,10 +107,11 @@ invalid.
 
 ### Model manifest
 
-The first manifest maps each `(layer_id, expert_id)` pair to its stored size in
-bytes. Sizes must be strictly positive; duplicate keys are invalid; lookups for
-undeclared experts fail rather than inventing a size. Later versions may add
-file offsets, alignment, packing, compression, and alternative precisions.
+The `v0.1` manifest maps each `(layer_id, expert_id)` pair to one logical size
+in bytes, used consistently for both cache capacity and load accounting. Sizes
+must be strictly positive; duplicate keys are invalid; lookups for undeclared
+experts fail rather than inventing a size. It does not model a checkpoint whose
+stored precision differs from its resident cache precision.
 
 Separating activation order from expert size prevents object-hit rate from
 hiding expensive misses on larger experts.
@@ -556,7 +554,7 @@ introduced:
 
 ## Architecture
 
-The project will start as a small Rust workspace:
+The project is a small Rust workspace:
 
 ```text
 moe-sim/
@@ -576,8 +574,8 @@ This is intentionally smaller than a crate-per-concept architecture. A new
 crate is justified only when a boundary has multiple consumers, needs isolated
 verification, or requires dependencies that the pure core should not inherit.
 
-The core remains synchronous and independent of storage or async runtimes until
-the storage-simulation milestone establishes a real need.
+The completed core remains synchronous and independent of storage or async
+runtimes. No storage-simulation milestone is scheduled.
 
 ## Offline baselines
 
@@ -586,7 +584,7 @@ size; atomic active sets fall outside that proof, which is why the belady
 section above claims oracle-checked equality on enumerated cases rather than
 optimality. Once expert objects have
 different sizes or fetch costs, the general offline caching problem is
-NP-hard. `moe-sim` will therefore not describe a scalable greedy
+NP-hard. `moe-sim` therefore does not describe a scalable greedy
 "byte-aware Belady" implementation as an optimum.
 
 `v0.1` uses classic Belady on uniform-size fixtures and a deliberately
@@ -613,9 +611,12 @@ transformations applied.
 ## Storage-aware work (optional, not scheduled)
 
 Layout-aware reads, device profiles, discrete-event queues, physical replay,
-prefetch, and compute overlap live in the roadmap as **optional explorations**.
-They are interesting research toys if curiosity remains after `v0.1` — not a
-promised second act.
+prefetch, and compute overlap remain parked roadmap ideas. None is part of the
+shipped project, and no second act is scheduled.
+
+Any separately scoped storage experiment would need distinct checkpoint-read
+and resident-cache byte sizes instead of silently reusing `size_bytes` for
+both.
 
 If latency experiments ever happen, every result must label inputs as measured,
 estimated, or synthetic. No device profile may be presented as portable across
@@ -636,13 +637,13 @@ project.
 
 ## Positioning
 
-The intended artifact is a reusable, honest comparison bench for MoE cache
+The shipped artifact is a reusable, honest comparison bench for MoE cache
 policies under explicit byte budgets — useful first for the author, optionally
 for others.
 
-Early work should claim correctness and reproducibility on synthetic fixtures,
-not novelty. Any publication-shaped claim needs a fresh prior-art review; none
-of that is required to enjoy or stop the project.
+The project claims correctness and reproducibility on its declared fixtures,
+not novelty. Any future publication-shaped claim would need a fresh prior-art
+review and a separately opened scope.
 
 ## License
 
