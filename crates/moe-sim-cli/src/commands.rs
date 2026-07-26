@@ -27,6 +27,14 @@ use crate::cli::{
 use crate::provenance::{INPUT_FORMAT_VERSION, sha256_hex, tool_version};
 use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trace_jsonl};
 
+mod compare;
+mod generate;
+
+/// Objective label carried by every belady result, so an offline reference
+/// never poses as an online policy's outcome.
+const BELADY_OBJECTIVE: &str =
+    "minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)";
+
 /// Errors surfaced by the `moe-sim` binary commands.
 ///
 /// Each variant maps to one process exit code via [`CliError::exit_code`].
@@ -35,15 +43,35 @@ use crate::{ManifestParseError, TraceParseError, parse_manifest_json, parse_trac
 /// quota combinations `clap` cannot express declaratively.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    /// The scope and quota flags contradict each other. Exit code 2.
+    /// Flags contradict each other. Exit code 2.
     ///
-    /// The rules depend on the value of `--cache-scope`, so they are checked
-    /// here rather than by `clap`: quotas require a per-layer scope, a
-    /// per-layer scope requires quotas, and no layer may be quoted twice.
+    /// The rules depend on the value of another flag, so they are checked
+    /// here rather than by `clap`: quotas and the cache scope must agree,
+    /// `compare` lists must be non-empty and duplicate-free, and generation
+    /// parameters must match their `--pattern`.
     #[error("{message}")]
     Usage {
         /// Description of the contradictory flags.
         message: String,
+    },
+    /// Synthetic generation rejected its parameters. Exit code 2 — the
+    /// parameters came from the command line.
+    ///
+    /// Carries the rendered domain error: the CLI boundary reports it, and
+    /// the typed original stays in `moe-sim-core`.
+    #[error("synthetic generation failed: {message}")]
+    Synthetic {
+        /// Rendered [`moe_sim_core::SyntheticError`] (or, defensively, a
+        /// downstream encoding error for data the generators cannot emit).
+        message: String,
+    },
+    /// A generated document could not be written. Exit code 3.
+    #[error("failed to write {}: {source}", path.display())]
+    Write {
+        /// Path that failed to write.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
     },
     /// An input file could not be read as UTF-8 text (missing path, I/O
     /// failure, or invalid UTF-8). Exit code 3.
@@ -95,13 +123,13 @@ pub enum CliError {
 }
 
 impl CliError {
-    /// Process exit code for this error: 2 usage, 3 read, 4 parse, 5
+    /// Process exit code for this error: 2 usage, 3 file I/O, 4 parse, 5
     /// capacity, 6 replay.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Usage { .. } => 2,
-            Self::Read { .. } => 3,
+            Self::Usage { .. } | Self::Synthetic { .. } => 2,
+            Self::Read { .. } | Self::Write { .. } => 3,
             Self::TraceParse { .. } | Self::ManifestParse { .. } => 4,
             Self::Capacity { .. } => 5,
             Self::Replay { .. } => 6,
@@ -113,17 +141,21 @@ impl CliError {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Usage`] when the scope and quota flags contradict
-/// each other, [`CliError::Read`] when an input file cannot be read as UTF-8
-/// text, [`CliError::TraceParse`] or [`CliError::ManifestParse`] when a file
+/// Returns [`CliError::Usage`] when flags contradict each other,
+/// [`CliError::Synthetic`] when generation parameters are impossible,
+/// [`CliError::Read`] when an input file cannot be read as UTF-8 text,
+/// [`CliError::Write`] when a generated file cannot be written,
+/// [`CliError::TraceParse`] or [`CliError::ManifestParse`] when a file
 /// is not a valid strict v1 document, [`CliError::Capacity`] when the
 /// capacity feasibility pass rejects the configuration, and
 /// [`CliError::Replay`] when replay itself fails afterwards.
 pub fn run(cli: &Cli) -> Result<String, CliError> {
     match &cli.command {
         Command::Trace(TraceCommand::Inspect(args)) => trace_inspect(args),
+        Command::Trace(TraceCommand::Generate(args)) => generate::run_generate(args),
         Command::Capacity(CapacityCommand::Check(args)) => capacity_check(args),
         Command::Run(args) => run_replay(args),
+        Command::Compare(args) => compare::run_compare(args),
     }
 }
 
@@ -386,10 +418,8 @@ fn render_run(
     metrics: &ReplayMetrics,
 ) -> String {
     let objective_line = match policy {
-        Policy::Belady => {
-            "objective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)\n"
-        }
-        Policy::NoCache | Policy::Lru | Policy::Lfu => "",
+        Policy::Belady => format!("objective: {BELADY_OBJECTIVE}\n"),
+        Policy::NoCache | Policy::Lru | Policy::Lfu => String::new(),
     };
     let mut report = format!(
         "status: ok\n\
@@ -789,6 +819,16 @@ mod tests {
         assert_eq!(trace_parse.exit_code(), 4);
         assert_eq!(manifest_parse.exit_code(), 4);
         assert_eq!(capacity.exit_code(), 5);
+
+        let synthetic = CliError::Synthetic {
+            message: "a synthetic pattern needs at least one expert".to_owned(),
+        };
+        let write = CliError::Write {
+            path: PathBuf::from("x"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        };
+        assert_eq!(synthetic.exit_code(), 2);
+        assert_eq!(write.exit_code(), 3);
     }
 
     #[test]

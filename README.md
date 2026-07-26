@@ -21,10 +21,12 @@ required journey — see [ROADMAP.md](ROADMAP.md).
 deterministic replay with byte-accurate accounting under no-cache, LRU, LFU,
 and an offline Belady reference whose results the test suite checks against a
 bounded exhaustive oracle on enumerated tiny cases — within one global budget
-or under explicit fixed per-layer quotas. The
-intended useful stop is Milestone 1 (`v0.1`): logical cache comparison under
-byte budgets. Everything beyond that is optional curiosity, not a tunnel to
-finish.
+or under explicit fixed per-layer quotas. The CLI generates deterministic
+synthetic traces (`trace generate`) and compares policies across budget
+sweeps (`compare`) in text, JSON, and CSV. Every Milestone 1 slice (1A–1D)
+has shipped; declaring `v0.1` — the intended useful stop: logical cache
+comparison under byte budgets — is the operator's next decision. Everything
+beyond that is optional curiosity, not a tunnel to finish.
 
 ## Why this project
 
@@ -124,8 +126,11 @@ A run selects:
 - one model manifest;
 - one total memory budget;
 - one cache scope: global or per-layer;
-- one policy;
-- one deterministic seed where a policy needs randomness.
+- one policy.
+
+No shipped policy is stochastic, so runs take no seed. The only seed in the
+tool belongs to synthetic input generation (`trace generate --pattern
+random`) and is recorded in that command's report.
 
 Policy and scope are independent. A global cache may use the full budget. A
 per-layer cache requires an explicit quota for every simulated layer; quotas
@@ -140,12 +145,13 @@ Every report records its inputs and their versions or checksums.
 
 ## CLI
 
-Three commands are implemented today: `trace inspect`, `capacity check`, and
-`run`. All are flag-driven (no positional arguments), take budgets as plain
-byte counts, print a deterministic report to stdout on success, and report
-typed errors on stderr with a meaningful exit code: `0` success, `2` bad
-arguments, `3` read failure, `4` parse failure, `5` capacity rejection, `6`
-replay failure. Failures never emit partial stdout.
+Five commands are implemented today: `trace inspect`, `trace generate`,
+`capacity check`, `run`, and `compare`. All are flag-driven (no positional
+arguments), take budgets as plain byte counts, print a deterministic report
+to stdout on success, and report typed errors on stderr with a meaningful
+exit code: `0` success, `2` bad arguments, `3` file I/O failure, `4` parse
+failure, `5` capacity rejection, `6` replay failure. Failures never emit
+partial stdout.
 
 `capacity check` and `run` take `--cache-scope global|per-layer` (default
 `global`). A per-layer scope additionally requires one repeated
@@ -418,17 +424,116 @@ oracle's optimum on every enumerated uniform-size case. A manifest with more
 than one expert size is rejected with exit code 6 rather than approximated,
 because general variable-size caching has no greedy byte-aware optimum.
 
-### Planned commands
+### Generating synthetic traces
 
-`compare` belongs to Milestone 1 and is not available yet:
+`trace generate` writes a deterministic synthetic trace and its twin
+manifest, then reports the parameters it consumed and the SHA-256 of each
+written file. Six patterns exist: `repetition`, `cyclic`, `random`,
+`hotset-shift`, `variable-sizes` (linearly growing expert sizes, so byte and
+object metrics separate), and `adversarial-lru`. Only `random` is
+stochastic: its `--seed` is required, recorded in the report, and reproduces
+the trace byte for byte; the deterministic patterns reject a seed instead of
+silently ignoring it. The generator is a pure function in `moe-sim-core`
+spread by an in-repo `SplitMix64` mixer, so equal parameters produce equal
+files on every platform. Parameters are explicitly bounded — at most 65,536
+experts, 10 million events, and 50 million total activations — so an
+impossible request fails with a typed error before anything allocates, and
+output paths that resolve to the same physical file (including symlink and
+hard-link aliases) are rejected before anything is written.
+
+The following two commands reproduce a full synthetic comparison from a
+clean checkout (after `cargo build`):
+
+```bash
+moe-sim trace generate \
+  --pattern cyclic \
+  --experts 3 \
+  --events 6 \
+  --out-trace target/cycle.jsonl \
+  --out-model-manifest target/cycle-manifest.json
+```
+
+```text
+status: ok
+tool_version: 0.1.0
+input_format: v1
+source: synthetic
+pattern: cyclic
+experts: 3
+events: 6
+out_trace: target/cycle.jsonl
+out_trace_sha256: 0681a6723000b94373ab6809ef5ed2d50d8e2a00a4c80c87e5ee9558616a7932
+out_model_manifest: target/cycle-manifest.json
+out_model_manifest_sha256: 822c6fa7b3cd162ec189d5c70c6acf006daad1b2d3ca5535e1240e73d3e04f9e
+```
+
+A local ~100k-event stress trace is regenerable the same way (for example
+`--pattern random --experts 64 --events 100000 --active-per-event 4 --seed
+42`); the test suite generates the equivalent traces in memory, so nothing
+large is committed.
+
+### Comparing policies
+
+`compare` replays one trace and manifest across a policy and budget matrix:
+`--policies` and `--global-budgets-bytes` are comma-separated lists whose
+order is preserved in the report, duplicates and unknown values are rejected
+by name, and only the global scope exists in `v0.1` (per-layer flags point
+back at `run`). Every replay completes before one byte of report exists, so
+an inapplicable combination — an infeasible budget, or `belady` selected
+against a variable-size manifest — rejects the whole comparison instead of
+emitting a partial table:
 
 ```bash
 moe-sim compare \
-  --trace fixtures/synthetic/active-set-0-1.jsonl \
-  --model-manifest fixtures/models/two-experts-4-6.json \
-  --memory-budgets-bytes 8,9,10 \
-  --cache-scope global \
-  --policies lru,lfu,belady
+  --trace target/cycle.jsonl \
+  --model-manifest target/cycle-manifest.json \
+  --global-budgets-bytes 2,3 \
+  --policies no-cache,lru,lfu,belady
+```
+
+```text
+status: ok
+tool_version: 0.1.0
+input_format: v1
+trace: target/cycle.jsonl
+trace_sha256: 0681a6723000b94373ab6809ef5ed2d50d8e2a00a4c80c87e5ee9558616a7932
+model_manifest: target/cycle-manifest.json
+model_manifest_sha256: 822c6fa7b3cd162ec189d5c70c6acf006daad1b2d3ca5535e1240e73d3e04f9e
+cache_scope: global
+policies: no-cache,lru,lfu,belady
+global_budgets_bytes: 2,3
+events: 6
+belady_objective: minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)
+results: 8
+policy no-cache budget 2: object_loads: 6, byte_loads: 6, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 3, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 1
+policy no-cache budget 3: object_loads: 6, byte_loads: 6, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 3, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 1
+policy lru budget 2: object_loads: 6, byte_loads: 6, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 3, evictions: 4, evicted_bytes: 4, peak_resident_bytes: 2
+policy lru budget 3: object_loads: 3, byte_loads: 3, object_hits: 3, byte_hits: 3, object_reloads: 0, byte_reloads: 0, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 3
+policy lfu budget 2: object_loads: 6, byte_loads: 6, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 3, evictions: 4, evicted_bytes: 4, peak_resident_bytes: 2
+policy lfu budget 3: object_loads: 3, byte_loads: 3, object_hits: 3, byte_hits: 3, object_reloads: 0, byte_reloads: 0, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 3
+policy belady budget 2: object_loads: 4, byte_loads: 4, object_hits: 2, byte_hits: 2, object_reloads: 1, byte_reloads: 1, evictions: 2, evicted_bytes: 2, peak_resident_bytes: 2
+policy belady budget 3: object_loads: 3, byte_loads: 3, object_hits: 3, byte_hits: 3, object_reloads: 0, byte_reloads: 0, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 3
+```
+
+`--output json` renders the same matrix as one machine-readable JSON object
+(provenance first, one row object per cell), and `--output csv` renders a
+table whose rows repeat the provenance columns so every line is
+self-contained; belady rows carry their objective in both, and all three
+formats are byte-identical across repeated runs:
+
+```bash
+moe-sim compare \
+  --trace target/cycle.jsonl \
+  --model-manifest target/cycle-manifest.json \
+  --global-budgets-bytes 2 \
+  --policies lru,belady \
+  --output csv
+```
+
+```text
+tool_version,input_format,trace,trace_sha256,model_manifest,model_manifest_sha256,cache_scope,policy,global_budget_bytes,objective,events,object_loads,byte_loads,object_hits,byte_hits,object_reloads,byte_reloads,evictions,evicted_bytes,peak_resident_bytes
+0.1.0,v1,target/cycle.jsonl,0681a6723000b94373ab6809ef5ed2d50d8e2a00a4c80c87e5ee9558616a7932,target/cycle-manifest.json,822c6fa7b3cd162ec189d5c70c6acf006daad1b2d3ca5535e1240e73d3e04f9e,global,lru,2,,6,6,6,0,0,3,3,4,4,2
+0.1.0,v1,target/cycle.jsonl,0681a6723000b94373ab6809ef5ed2d50d8e2a00a4c80c87e5ee9558616a7932,target/cycle-manifest.json,822c6fa7b3cd162ec189d5c70c6acf006daad1b2d3ca5535e1240e73d3e04f9e,global,belady,2,"minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)",6,4,4,2,2,1,1,2,2,2
 ```
 
 ## Correctness principles

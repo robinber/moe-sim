@@ -10,8 +10,11 @@
 //! source revision nor the dependency lock. Recording those is a separate
 //! decision, not something this module silently implies.
 //!
-//! Seeds are deliberately absent. No `moe-sim` command is stochastic yet;
-//! a seed field arrives with the first policy that needs randomness.
+//! Seed provenance: the one stochastic command is
+//! `trace generate --pattern random`, whose generation report records its
+//! `seed:` beside the tool version, contract version, and output digests,
+//! so a synthetic input is reproducible from its report alone. Replay
+//! commands stay seedless because no shipped policy is stochastic.
 
 use sha2::{Digest, Sha256};
 

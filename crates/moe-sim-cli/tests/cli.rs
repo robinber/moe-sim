@@ -3,8 +3,8 @@
 //! Each test spawns the real binary via `CARGO_BIN_EXE_moe-sim` and pins the
 //! frozen process contract:
 //!
-//! - exit codes: 0 ok, 2 bad argv, 3 read/UTF-8/path, 4 parse/domain wire, 5
-//!   capacity rejection, 6 replay failure;
+//! - exit codes: 0 ok, 2 bad argv, 3 file I/O (read, UTF-8, path, write), 4
+//!   parse/domain wire, 5 capacity rejection, 6 replay failure;
 //! - stdout carries only complete success reports; failures never emit partial
 //!   stdout;
 //! - stderr carries one `error:` line with the full typed error chain.
@@ -468,7 +468,7 @@ fn negative_budget_is_a_usage_error() {
     assert_eq!(stdout(&output), "");
 }
 
-// Read failures (exit 3).
+// File I/O failures (exit 3): reads here, writes in the generate section.
 
 #[test]
 fn trace_inspect_of_a_missing_file_exits_3() {
@@ -1131,4 +1131,644 @@ fn run_belady_on_a_variable_size_manifest_exits_6() {
         "error: replay failed: belady requires a uniform expert size: \
          layer 0 expert 0 has 4 bytes, layer 0 expert 1 has 6 bytes\n"
     );
+}
+
+// `compare` (slice 1D): one policy and budget matrix, three output formats.
+
+/// The compare invocation every matrix test uses: two budgets, all four
+/// policies, over the committed cycle fixture.
+fn compare_cycle(extra: &[&str]) -> Output {
+    let mut args = vec![
+        "compare",
+        "--trace",
+        "fixtures/synthetic/three-experts-cycle.jsonl",
+        "--model-manifest",
+        "fixtures/models/three-experts-uniform.json",
+        "--global-budgets-bytes",
+        "4,6",
+        "--policies",
+        "no-cache,lru,lfu,belady",
+    ];
+    args.extend_from_slice(extra);
+    moe_sim(&args)
+}
+
+const COMPARE_OBJECTIVE: &str =
+    "minimum object loads (offline reference, uniform expert sizes, whole-trace lookahead)";
+
+#[test]
+fn compare_text_report_matches_the_hand_calculated_matrix() {
+    // Metrics per cell mirror the byte-exact `run` tests on this fixture:
+    // a two-object budget where LRU/LFU thrash and belady loads 4, and a
+    // three-object budget where every retaining policy holds the set.
+    let output = compare_cycle(&[]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
+         trace: fixtures/synthetic/three-experts-cycle.jsonl\n\
+         trace_sha256: {THREE_EXPERTS_CYCLE_TRACE_SHA256}\n\
+         model_manifest: fixtures/models/three-experts-uniform.json\n\
+         model_manifest_sha256: {THREE_EXPERTS_UNIFORM_MANIFEST_SHA256}\n\
+         cache_scope: global\n\
+         policies: no-cache,lru,lfu,belady\n\
+         global_budgets_bytes: 4,6\n\
+         events: 6\n\
+         belady_objective: {COMPARE_OBJECTIVE}\n\
+         results: 8\n\
+         policy no-cache budget 4: object_loads: 6, byte_loads: 12, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 6, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 2\n\
+         policy no-cache budget 6: object_loads: 6, byte_loads: 12, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 6, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 2\n\
+         policy lru budget 4: object_loads: 6, byte_loads: 12, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 6, evictions: 4, evicted_bytes: 8, peak_resident_bytes: 4\n\
+         policy lru budget 6: object_loads: 3, byte_loads: 6, object_hits: 3, byte_hits: 6, object_reloads: 0, byte_reloads: 0, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 6\n\
+         policy lfu budget 4: object_loads: 6, byte_loads: 12, object_hits: 0, byte_hits: 0, object_reloads: 3, byte_reloads: 6, evictions: 4, evicted_bytes: 8, peak_resident_bytes: 4\n\
+         policy lfu budget 6: object_loads: 3, byte_loads: 6, object_hits: 3, byte_hits: 6, object_reloads: 0, byte_reloads: 0, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 6\n\
+         policy belady budget 4: object_loads: 4, byte_loads: 8, object_hits: 2, byte_hits: 4, object_reloads: 1, byte_reloads: 2, evictions: 2, evicted_bytes: 4, peak_resident_bytes: 4\n\
+         policy belady budget 6: object_loads: 3, byte_loads: 6, object_hits: 3, byte_hits: 6, object_reloads: 0, byte_reloads: 0, evictions: 0, evicted_bytes: 0, peak_resident_bytes: 6\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn compare_json_report_is_byte_stable_and_labels_belady_rows() {
+    let output = compare_cycle(&["--output", "json"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    assert!(report.starts_with("{\n  \"status\": \"ok\",\n"), "{report}");
+    assert!(
+        report.contains(&format!(
+            "\"tool_version\": \"{}\",\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains("\"policies\": [\"no-cache\",\"lru\",\"lfu\",\"belady\"],"),
+        "{report}"
+    );
+    assert!(
+        report.contains("\"global_budgets_bytes\": [4,6],"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "{\"policy\": \"belady\", \"global_budget_bytes\": 4, \"objective\": \
+             \"minimum object loads (offline reference, uniform expert sizes, whole-trace \
+             lookahead)\", \"object_loads\": 4, \"byte_loads\": 8, \"object_hits\": 2, \
+             \"byte_hits\": 4, \"object_reloads\": 1, \"byte_reloads\": 2, \"evictions\": 2, \
+             \"evicted_bytes\": 4, \"peak_resident_bytes\": 4}"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "{\"policy\": \"lru\", \"global_budget_bytes\": 6, \"object_loads\": 3, \
+             \"byte_loads\": 6, \"object_hits\": 3, \"byte_hits\": 6, \"object_reloads\": 0, \
+             \"byte_reloads\": 0, \"evictions\": 0, \"evicted_bytes\": 0, \
+             \"peak_resident_bytes\": 6}"
+        ),
+        "{report}"
+    );
+    assert!(report.ends_with("  ]\n}\n"), "{report}");
+}
+
+#[test]
+fn compare_csv_rows_are_self_contained_and_quote_the_objective() {
+    let output = compare_cycle(&["--output", "csv"]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    let provenance = format!(
+        "{},v1,fixtures/synthetic/three-experts-cycle.jsonl,{THREE_EXPERTS_CYCLE_TRACE_SHA256},\
+         fixtures/models/three-experts-uniform.json,{THREE_EXPERTS_UNIFORM_MANIFEST_SHA256},global",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        report,
+        format!(
+            "tool_version,input_format,trace,trace_sha256,model_manifest,model_manifest_sha256,\
+             cache_scope,policy,global_budget_bytes,objective,events,object_loads,byte_loads,\
+             object_hits,byte_hits,object_reloads,byte_reloads,evictions,evicted_bytes,\
+             peak_resident_bytes\n\
+             {provenance},no-cache,4,,6,6,12,0,0,3,6,0,0,2\n\
+             {provenance},no-cache,6,,6,6,12,0,0,3,6,0,0,2\n\
+             {provenance},lru,4,,6,6,12,0,0,3,6,4,8,4\n\
+             {provenance},lru,6,,6,3,6,3,6,0,0,0,0,6\n\
+             {provenance},lfu,4,,6,6,12,0,0,3,6,4,8,4\n\
+             {provenance},lfu,6,,6,3,6,3,6,0,0,0,0,6\n\
+             {provenance},belady,4,\"{COMPARE_OBJECTIVE}\",6,4,8,2,4,1,2,2,4,4\n\
+             {provenance},belady,6,\"{COMPARE_OBJECTIVE}\",6,3,6,3,6,0,0,0,0,6\n"
+        )
+    );
+}
+
+#[test]
+fn compare_reports_are_identical_across_repeated_runs() {
+    for format in ["text", "json", "csv"] {
+        let first = compare_cycle(&["--output", format]);
+        let second = compare_cycle(&["--output", format]);
+        assert_eq!(first.status.code(), Some(0));
+        assert_eq!(stdout(&first), stdout(&second), "format {format}");
+    }
+}
+
+#[test]
+fn compare_rejects_duplicates_and_per_layer_flags_as_usage_errors() {
+    for (extra, expected) in [
+        (
+            vec!["--policies", "lru,lru", "--global-budgets-bytes", "4"],
+            "error: policy lru appears more than once in --policies\n",
+        ),
+        (
+            vec!["--policies", "lru", "--global-budgets-bytes", "4,4"],
+            "error: budget 4 appears more than once in --global-budgets-bytes\n",
+        ),
+        (
+            vec![
+                "--policies",
+                "lru",
+                "--global-budgets-bytes",
+                "4",
+                "--cache-scope",
+                "per-layer",
+            ],
+            "error: --cache-scope per-layer is not supported by compare in v0.1; \
+             use run for per-layer replays\n",
+        ),
+        (
+            vec![
+                "--policies",
+                "lru",
+                "--global-budgets-bytes",
+                "4",
+                "--layer-quota-bytes",
+                "0:4",
+            ],
+            "error: --layer-quota-bytes is not supported by compare in v0.1; \
+             use run for per-layer replays\n",
+        ),
+    ] {
+        let mut args = vec![
+            "compare",
+            "--trace",
+            "fixtures/synthetic/three-experts-cycle.jsonl",
+            "--model-manifest",
+            "fixtures/models/three-experts-uniform.json",
+        ];
+        args.extend_from_slice(&extra);
+        let output = moe_sim(&args);
+        assert_eq!(output.status.code(), Some(2), "{extra:?}");
+        assert_eq!(stdout(&output), "", "{extra:?}");
+        assert_eq!(stderr(&output), expected, "{extra:?}");
+    }
+}
+
+#[test]
+fn compare_names_an_unknown_policy_value_precisely() {
+    let output = moe_sim(&[
+        "compare",
+        "--trace",
+        "t",
+        "--model-manifest",
+        "m",
+        "--global-budgets-bytes",
+        "4",
+        "--policies",
+        "lru,mru",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).contains("invalid value 'mru' for '--policies"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn compare_emits_nothing_when_one_selected_combination_is_inapplicable() {
+    // belady is selected against a variable-size manifest: the whole
+    // comparison is rejected before one byte of report exists, even though
+    // the lru cells alone would have succeeded.
+    let output = moe_sim(&[
+        "compare",
+        "--trace",
+        "fixtures/synthetic/two-layers.jsonl",
+        "--model-manifest",
+        "fixtures/models/two-layers.json",
+        "--global-budgets-bytes",
+        "15",
+        "--policies",
+        "lru,belady",
+    ]);
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: replay failed: belady requires a uniform expert size: \
+         layer 0 expert 0 has 4 bytes, layer 0 expert 1 has 6 bytes\n"
+    );
+}
+
+#[test]
+fn compare_rejects_an_infeasible_budget_anywhere_in_the_sweep() {
+    let output = moe_sim(&[
+        "compare",
+        "--trace",
+        "fixtures/synthetic/three-experts-cycle.jsonl",
+        "--model-manifest",
+        "fixtures/models/three-experts-uniform.json",
+        "--global-budgets-bytes",
+        "6,1",
+        "--policies",
+        "lru",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: capacity check failed: expert exceeds global capacity: \
+         layer 0 expert 0 has size 2 bytes, global budget is 1 bytes\n"
+    );
+}
+
+// `trace generate` (slice 1D): deterministic synthetic inputs on disk.
+
+/// Digests of the generated cyclic 3-expert / 6-event pair, produced outside
+/// this crate with `shasum -a 256` on the written files.
+const GENERATED_CYCLE_TRACE_SHA256: &str =
+    "0681a6723000b94373ab6809ef5ed2d50d8e2a00a4c80c87e5ee9558616a7932";
+const GENERATED_CYCLE_MANIFEST_SHA256: &str =
+    "822c6fa7b3cd162ec189d5c70c6acf006daad1b2d3ca5535e1240e73d3e04f9e";
+
+/// Workspace-root-relative scratch path for one generated file.
+fn generated_path(name: &str) -> String {
+    std::fs::create_dir_all(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/test-generate"
+    ))
+    .unwrap();
+    format!("target/test-generate/{name}")
+}
+
+#[test]
+fn trace_generate_writes_the_pinned_cycle_pair_and_reports_its_digests() {
+    let trace_path = generated_path("pinned-cycle.jsonl");
+    let manifest_path = generated_path("pinned-cycle-manifest.json");
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        &trace_path,
+        "--out-model-manifest",
+        &manifest_path,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "status: ok\n\
+         tool_version: {}\n\
+         input_format: v1\n\
+         source: synthetic\n\
+         pattern: cyclic\n\
+         experts: 3\n\
+         events: 6\n\
+         out_trace: {trace_path}\n\
+         out_trace_sha256: {GENERATED_CYCLE_TRACE_SHA256}\n\
+         out_model_manifest: {manifest_path}\n\
+         out_model_manifest_sha256: {GENERATED_CYCLE_MANIFEST_SHA256}\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(stderr(&output), "");
+
+    // The tool's own provenance path must agree with the generation report:
+    // inspect and capacity check recompute the digests from the files.
+    let inspect = moe_sim(&["trace", "inspect", "--trace", &trace_path]);
+    assert_eq!(inspect.status.code(), Some(0));
+    assert_eq!(
+        field(stdout(&inspect), "trace_sha256"),
+        GENERATED_CYCLE_TRACE_SHA256
+    );
+    assert_eq!(field(stdout(&inspect), "events"), "6");
+
+    let check = moe_sim(&[
+        "capacity",
+        "check",
+        "--trace",
+        &trace_path,
+        "--model-manifest",
+        &manifest_path,
+        "--global-budget-bytes",
+        "2",
+    ]);
+    assert_eq!(check.status.code(), Some(0), "stderr: {}", stderr(&check));
+    assert_eq!(
+        field(stdout(&check), "model_manifest_sha256"),
+        GENERATED_CYCLE_MANIFEST_SHA256
+    );
+}
+
+#[test]
+fn trace_generate_random_reproduces_from_its_seed_and_diverges_without_it() {
+    let mut digests = Vec::new();
+    for (name, seed) in [("seed7-a", "7"), ("seed7-b", "7"), ("seed8", "8")] {
+        let trace_path = generated_path(&format!("random-{name}.jsonl"));
+        let manifest_path = generated_path(&format!("random-{name}-manifest.json"));
+        let output = moe_sim(&[
+            "trace",
+            "generate",
+            "--pattern",
+            "random",
+            "--experts",
+            "8",
+            "--events",
+            "10",
+            "--active-per-event",
+            "2",
+            "--seed",
+            seed,
+            "--out-trace",
+            &trace_path,
+            "--out-model-manifest",
+            &manifest_path,
+        ]);
+        assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+        let report = stdout(&output);
+        assert_eq!(field(report, "seed"), seed);
+        digests.push(field(report, "out_trace_sha256").to_owned());
+    }
+    assert_eq!(digests[0], digests[1], "same seed must reproduce the trace");
+    assert_ne!(digests[0], digests[2], "another seed must diverge");
+}
+
+#[test]
+fn trace_generate_rejects_parameters_that_do_not_match_the_pattern() {
+    for (extra, expected) in [
+        (
+            vec!["--pattern", "cyclic", "--seed", "1"],
+            "error: --seed only applies to --pattern random\n",
+        ),
+        (
+            vec!["--pattern", "random", "--active-per-event", "1"],
+            "error: --seed is required by --pattern random\n",
+        ),
+        (
+            vec!["--pattern", "repetition"],
+            "error: --active-per-event is required by --pattern repetition\n",
+        ),
+        (
+            vec!["--pattern", "hotset-shift", "--hot", "2"],
+            "error: --period is required by --pattern hotset-shift\n",
+        ),
+        (
+            vec!["--pattern", "cyclic", "--hot", "2"],
+            "error: --hot only applies to --pattern hotset-shift\n",
+        ),
+        (
+            vec!["--pattern", "variable-sizes", "--active-per-event", "2"],
+            "error: --active-per-event only applies to --pattern repetition or random\n",
+        ),
+    ] {
+        let mut args = vec![
+            "trace",
+            "generate",
+            "--experts",
+            "4",
+            "--events",
+            "6",
+            "--out-trace",
+            "target/test-generate/never-written.jsonl",
+            "--out-model-manifest",
+            "target/test-generate/never-written.json",
+        ];
+        args.extend_from_slice(&extra);
+        let output = moe_sim(&args);
+        assert_eq!(output.status.code(), Some(2), "{extra:?}");
+        assert_eq!(stdout(&output), "", "{extra:?}");
+        assert_eq!(stderr(&output), expected, "{extra:?}");
+    }
+}
+
+#[test]
+fn trace_generate_rejects_impossible_parameters_from_the_domain() {
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "adversarial-lru",
+        "--experts",
+        "1",
+        "--events",
+        "6",
+        "--out-trace",
+        "target/test-generate/never-written.jsonl",
+        "--out-model-manifest",
+        "target/test-generate/never-written.json",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: synthetic generation failed: \
+         the adversarial-lru pattern needs at least two experts: got 1\n"
+    );
+}
+
+#[test]
+fn trace_generate_reports_an_unwritable_path_with_exit_3() {
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        "/nonexistent-moe-sim-dir/t.jsonl",
+        "--out-model-manifest",
+        "target/test-generate/never-written.json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output).starts_with("error: failed to write /nonexistent-moe-sim-dir/t.jsonl:"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn compare_preserves_the_callers_policy_and_budget_order() {
+    // Descending budgets and a non-canonical policy order must come back
+    // exactly as given: the report never sorts the caller's lists.
+    let output = moe_sim(&[
+        "compare",
+        "--trace",
+        "fixtures/synthetic/three-experts-cycle.jsonl",
+        "--model-manifest",
+        "fixtures/models/three-experts-uniform.json",
+        "--global-budgets-bytes",
+        "6,4",
+        "--policies",
+        "belady,no-cache",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let report = stdout(&output);
+    assert_eq!(field(report, "policies"), "belady,no-cache");
+    assert_eq!(field(report, "global_budgets_bytes"), "6,4");
+    let rows: Vec<&str> = report
+        .lines()
+        .filter(|line| line.starts_with("policy "))
+        .collect();
+    assert_eq!(rows.len(), 4);
+    assert!(rows[0].starts_with("policy belady budget 6:"), "{report}");
+    assert!(rows[1].starts_with("policy belady budget 4:"), "{report}");
+    assert!(rows[2].starts_with("policy no-cache budget 6:"), "{report}");
+    assert!(rows[3].starts_with("policy no-cache budget 4:"), "{report}");
+}
+
+#[test]
+fn trace_generate_rejects_identical_output_paths() {
+    // One file silently overwriting the other would report success while
+    // destroying the trace it just advertised.
+    let path = generated_path("aliased.json");
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        &path,
+        "--out-model-manifest",
+        &path,
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --out-trace and --out-model-manifest resolve to the same file; \
+         name two different destinations\n"
+    );
+    let workspace = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    assert!(
+        !workspace.join(&path).exists(),
+        "nothing may be written on a rejected collision"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_generate_rejects_outputs_aliased_through_a_symlinked_directory() {
+    // Two different spellings, one physical file: the second directory is a
+    // symlink to the first. Writing would let the manifest overwrite the
+    // trace while the report advertises two digests for one file.
+    let workspace = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let real_dir = workspace.join("target/test-generate/real-dir");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let link_dir = workspace.join("target/test-generate/link-dir");
+    match std::os::unix::fs::symlink(&real_dir, &link_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("cannot create the symlinked directory: {error}"),
+    }
+
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        "target/test-generate/real-dir/pair.jsonl",
+        "--out-model-manifest",
+        "target/test-generate/link-dir/pair.jsonl",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: --out-trace and --out-model-manifest resolve to the same file; \
+         name two different destinations\n"
+    );
+    assert!(
+        !real_dir.join("pair.jsonl").exists(),
+        "nothing may be written on a rejected collision"
+    );
+}
+
+#[test]
+fn a_failed_second_write_leaves_the_first_file_and_no_report() {
+    // The two writes are not atomic, and that is documented behavior: the
+    // trace lands, the manifest write fails, exit 3, and the report — the
+    // only success signal — is never printed.
+    let trace_path = generated_path("half-pair.jsonl");
+    let output = moe_sim(&[
+        "trace",
+        "generate",
+        "--pattern",
+        "cyclic",
+        "--experts",
+        "3",
+        "--events",
+        "6",
+        "--out-trace",
+        &trace_path,
+        "--out-model-manifest",
+        "/nonexistent-moe-sim-dir/m.json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stdout(&output), "");
+    let on_disk = std::fs::read_to_string(
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join(&trace_path),
+    )
+    .unwrap();
+    assert_eq!(on_disk.lines().count(), 6);
+}
+
+#[test]
+fn compare_requires_both_lists_explicitly() {
+    // The non-empty rule must hold even if the `required` derive attribute
+    // is dropped: omitting either list is a usage error, never an empty
+    // zero-row success report.
+    for missing in [
+        vec!["--policies", "lru"],
+        vec!["--global-budgets-bytes", "4"],
+    ] {
+        let mut args = vec![
+            "compare",
+            "--trace",
+            "fixtures/synthetic/three-experts-cycle.jsonl",
+            "--model-manifest",
+            "fixtures/models/three-experts-uniform.json",
+        ];
+        args.extend_from_slice(&missing);
+        let output = moe_sim(&args);
+        assert_eq!(output.status.code(), Some(2), "{missing:?}");
+        assert_eq!(stdout(&output), "", "{missing:?}");
+        assert!(
+            stderr(&output).contains("required"),
+            "{missing:?}: {}",
+            stderr(&output)
+        );
+    }
 }
