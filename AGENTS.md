@@ -34,8 +34,16 @@ the interpretation that permits more work.
 2. [`docs/contracts.md`](docs/contracts.md) before any change to replay,
    policies, capacity, metrics, or reports.
 3. [`README.md`](README.md) for product shape.
-4. [`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md)
-   before Rust or Cargo work.
+4. Shared Rust skill **rust-strict** (v1.0.2+) before any Rust or Cargo work.
+   Same content, tool-specific discovery paths (git submodules, pin tag):
+
+   | Tool | Path |
+   | --- | --- |
+   | Codex | [`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md) |
+   | Claude Code | [`.claude/skills/rust-strict/SKILL.md`](.claude/skills/rust-strict/SKILL.md) |
+   | Grok | [`.grok/skills/rust-strict/SKILL.md`](.grok/skills/rust-strict/SKILL.md) |
+
+   Source: https://github.com/robinber/agent-skills-rust
 5. [`.agents/skills/kira/SKILL.md`](.agents/skills/kira/SKILL.md) before
    Kira multi-agent coordination.
 6. Rust policy files: [`Cargo.toml`](Cargo.toml),
@@ -47,7 +55,8 @@ the interpretation that permits more work.
 
 ## Workspace
 
-- Cargo workspace, resolver `3`, edition `2024`, Rust `1.97.0`.
+- Cargo workspace, resolver `3`, edition `2024`, Rust `1.97.0`
+  (`rust-toolchain.toml` + workspace package metadata).
 - License MIT; workspace packages `publish = false`.
 - Crates: `moe-sim-core`, `moe-sim-cli` (dependency: CLI → core).
 - Layout: `crates/`, `fixtures/{synthetic,models}/`, `docs/`.
@@ -55,6 +64,11 @@ the interpretation that permits more work.
   ownership boundary; otherwise keep the two-crate layout.
 - New workspace members inherit `[lints] workspace = true`.
 - Commit `Cargo.lock` (application workspace).
+- Nightly only when required (repo fmt uses `cargo +nightly fmt`).
+- Drift profile: rust-strict defaults (800 / 1000 LOC, ≤ 6 params) unless
+  overridden here.
+- `clippy::pedantic` is workspace-wide policy here — do not weaken without an
+  explicit operator decision.
 
 ## Architecture boundaries
 
@@ -126,8 +140,9 @@ Preferred patterns:
 - `clippy::pedantic` is workspace-wide; only selected restriction rules apply
   (see `Cargo.toml`).
 
-Details and deeper Rust guidance:
-[`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md).
+Details and deeper Rust guidance: the shared **rust-strict** skill (see load
+order paths). Product contracts, crate boundaries, and parked status stay in
+this file and `docs/`.
 
 ## Verification
 
