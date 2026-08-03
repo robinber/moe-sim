@@ -34,16 +34,16 @@ the interpretation that permits more work.
 2. [`docs/contracts.md`](docs/contracts.md) before any change to replay,
    policies, capacity, metrics, or reports.
 3. [`README.md`](README.md) for product shape.
-4. Shared Rust skill **rust-strict** (v1.0.2+) before any Rust or Cargo work.
-   Same content, tool-specific discovery paths (git submodules, pin tag):
+4. Shared Rust skill **rust-strict** (v1.1.0+) before any Rust or Cargo work.
+   One canonical checkout; Claude/Grok paths are symlinks to it:
 
    | Tool | Path |
    | --- | --- |
-   | Codex | [`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md) |
-   | Claude Code | [`.claude/skills/rust-strict/SKILL.md`](.claude/skills/rust-strict/SKILL.md) |
-   | Grok | [`.grok/skills/rust-strict/SKILL.md`](.grok/skills/rust-strict/SKILL.md) |
+   | Codex (canonical submodule) | [`.agents/skills/rust-strict/SKILL.md`](.agents/skills/rust-strict/SKILL.md) |
+   | Claude Code | [`.claude/skills/rust-strict/SKILL.md`](.claude/skills/rust-strict/SKILL.md) → symlink |
+   | Grok | [`.grok/skills/rust-strict/SKILL.md`](.grok/skills/rust-strict/SKILL.md) → symlink |
 
-   Source: https://github.com/robinber/agent-skills-rust
+   Source: https://github.com/robinber/agent-skills-rust (pin tag, currently `v1.1.0`)
 5. [`.agents/skills/kira/SKILL.md`](.agents/skills/kira/SKILL.md) before
    Kira multi-agent coordination.
 6. Rust policy files: [`Cargo.toml`](Cargo.toml),
