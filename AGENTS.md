@@ -34,7 +34,7 @@ the interpretation that permits more work.
 2. [`docs/contracts.md`](docs/contracts.md) before any change to replay,
    policies, capacity, metrics, or reports.
 3. [`README.md`](README.md) for product shape.
-4. Shared Rust skill **rust-strict** (v1.2.0+) before any Rust or Cargo work.
+4. Shared Rust skill **rust-strict** (v1.3.0+) before any Rust or Cargo work.
    One canonical checkout; Claude/Grok paths are symlinks to it:
 
    | Tool | Path |
@@ -43,7 +43,7 @@ the interpretation that permits more work.
    | Claude Code | [`.claude/skills/rust-strict/SKILL.md`](.claude/skills/rust-strict/SKILL.md) → symlink |
    | Grok | [`.grok/skills/rust-strict/SKILL.md`](.grok/skills/rust-strict/SKILL.md) → symlink |
 
-   Source: https://github.com/robinber/agent-skills-rust (pin tag, currently `v1.2.0`)
+   Source: https://github.com/robinber/agent-skills-rust (pin tag, currently `v1.3.0`)
 5. [`.agents/skills/kira/SKILL.md`](.agents/skills/kira/SKILL.md) before
    Kira multi-agent coordination.
 6. Rust policy files: [`Cargo.toml`](Cargo.toml),
